@@ -1,0 +1,13 @@
+span: {start: "2023-01-01", end: "2025-09-20"}
+cadence_minutes: 12
+window_hours: 48
+window_stride_hours: 6
+targets_hours: [6, 12, 24]
+censoring: {cmd_deg_threshold: 70}
+resize: {target_px: 256}
+paths:
+  raw_dir:       "data/holdout/raw"
+  interim_dir:   "data/holdout/interim"
+  processed_dir: "data/holdout/processed"
+  cache_dir:     "data/holdout/cache"
+  logs_dir:      "data/holdout/logs"

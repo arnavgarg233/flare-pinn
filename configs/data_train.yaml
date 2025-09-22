@@ -1,0 +1,13 @@
+span: {start: "2010-05-01", end: "2017-12-31"}
+cadence_minutes: 12
+window_hours: 48
+window_stride_hours: 6
+targets_hours: [6, 12, 24]
+censoring: {cmd_deg_threshold: 70}
+resize: {target_px: 256}
+paths:
+  raw_dir:       "data/train/raw"
+  interim_dir:   "data/train/interim"
+  processed_dir: "data/train/processed"
+  cache_dir:     "data/train/cache"
+  logs_dir:      "data/train/logs"

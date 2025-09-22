@@ -1,0 +1,22 @@
+name: flare-pinn
+channels: [conda-forge, defaults]
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - xarray
+  - astropy
+  - sunpy
+  - drms
+  - scikit-image
+  - opencv
+  - pyarrow
+  - fastparquet
+  - tqdm
+  - pydantic
+  - pyyaml
+  - click
+  - pip:
+      - parfive  # used by sunpy downloads
