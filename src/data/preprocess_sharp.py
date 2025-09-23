@@ -5,7 +5,7 @@ from astropy.io import fits
 from tqdm import tqdm
 import click, cv2
 
-from utils.common import (
+from src.utils.common import (
     load_cfg, ensure_dirs, to_local_fields,
     pixel_scale_Mm_per_pix_from_header, cmd_abs_deg_from_header
 )

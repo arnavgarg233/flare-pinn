@@ -3,7 +3,7 @@ import numpy as np, pandas as pd
 from tqdm import tqdm
 import click
 
-from utils.common import load_cfg, finite_diff_divergence
+from src.utils.common import load_cfg, finite_diff_divergence
 
 @click.command()
 @click.option("--cfg", default="configs/data_train.yaml")

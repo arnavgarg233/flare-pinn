@@ -5,7 +5,7 @@ from tqdm import tqdm
 import click
 import drms
 
-from utils.common import load_cfg, ensure_dirs
+from src.utils.common import load_cfg, ensure_dirs
 
 @click.command()
 @click.option("--cfg", default="configs/data_train.yaml", help="Config path.")

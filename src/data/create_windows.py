@@ -3,7 +3,7 @@ import pandas as pd
 from tqdm import tqdm
 import click
 
-from utils.common import load_cfg, ensure_dirs
+from src.utils.common import load_cfg, ensure_dirs
 
 @click.command()
 @click.option("--cfg", default="configs/data_train.yaml")
