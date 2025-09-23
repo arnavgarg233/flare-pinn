@@ -1,29 +1,67 @@
 # src/data/fetch_flares.py
 from __future__ import annotations
 
-from pathlib import Path
+import glob
+import multiprocessing as mp
+import os
+import random
+import re
+import sys
+import tempfile
+import time
+import traceback
+import uuid
 from datetime import datetime
-import time, random, re, sys, glob, traceback, os, tempfile, uuid
-from typing import Tuple, Set, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
-import pandas as pd
 import click
+import pandas as pd
+from pydantic import BaseModel, Field
 
 # SunPy HEK/Fido
 from sunpy.net import attrs as a, Fido
 from sunpy.net import hek as hek_mod
-
-# robust, pool-free subprocess timeouts
-import multiprocessing as mp
 
 from src.utils.common import load_cfg, ensure_dirs
 
 LETTER_FLUX = {"A": 1e-8, "B": 1e-7, "C": 1e-6, "M": 1e-5, "X": 1e-4}
 
 
+# ---------------- Pydantic Models ----------------
+
+class FlareColumnMapping(BaseModel):
+    """Strongly typed column mapping for HEK flare data."""
+    event_starttime: str = Field(default="start", description="Start time column")
+    event_peaktime: str = Field(default="peak", description="Peak time column") 
+    event_endtime: str = Field(default="end", description="End time column")
+    fl_goescls: str = Field(default="class", description="GOES class column")
+    ar_noaanum: str = Field(default="noaa_ar", description="NOAA AR number column")
+    
+    def get_mapping_dict(self) -> Dict[str, str]:
+        """Convert to dictionary for pandas rename operation."""
+        return {
+            "event_starttime": self.event_starttime,
+            "event_peaktime": self.event_peaktime,
+            "event_endtime": self.event_endtime,
+            "fl_goescls": self.fl_goescls,
+            "ar_noaanum": self.ar_noaanum,
+        }
+
+
+class FlareQueryConfig(BaseModel):
+    """Configuration for flare query parameters."""
+    provider: str = Field(default="auto", description="HEK provider (auto/fido/client)")
+    timeout_s: float = Field(default=90.0, description="Query timeout in seconds")
+    retries: int = Field(default=2, description="Number of retry attempts")
+    min_days: int = Field(default=2, description="Minimum days for range splitting")
+    sleep_base: float = Field(default=5.0, description="Base sleep time for retries")
+    debug: bool = Field(default=False, description="Enable debug output")
+
+
 # ---------------- GOES helpers ----------------
 
-def parse_goes_class(s: str):
+def parse_goes_class(s: str) -> Tuple[Optional[float], Optional[str]]:
     """'M1.2' -> (1.2e-5, 'M'); returns (None, None) if unparseable."""
     if not isinstance(s, str):
         return None, None
@@ -46,14 +84,44 @@ def cutoff_string_for_class(letter: str) -> str:
 # ---------------- child process runner (NO POOLS) ----------------
 
 def _to_temp_parquet(df: pd.DataFrame) -> str:
+    """Convert DataFrame to parquet with proper type handling for PyArrow compatibility."""
     tmpdir = Path(tempfile.gettempdir()) / "hek_tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     p = tmpdir / f"hek_{uuid.uuid4().hex}.parquet"
-    df.to_parquet(p, index=False)
+    
+    # Clean DataFrame for PyArrow compatibility
+    df_clean = _clean_dataframe_for_parquet(df)
+    df_clean.to_parquet(p, index=False, engine='pyarrow')
     return str(p)
 
 
-def _child_run(conn, which: str, start: str, end: str, class_letter: str):
+def _clean_dataframe_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean DataFrame to ensure PyArrow compatibility."""
+    if df.empty:
+        return df
+    
+    df_clean = df.copy()
+    
+    # Convert object columns to string to avoid PyArrow issues
+    for col in df_clean.columns:
+        if df_clean[col].dtype == 'object':
+            # Convert to string, handling NaN values
+            df_clean[col] = df_clean[col].astype(str).replace('nan', None)
+        
+        # Handle datetime columns
+        elif 'datetime' in str(df_clean[col].dtype):
+            # Ensure datetime columns are timezone-naive
+            if hasattr(df_clean[col].dtype, 'tz') and df_clean[col].dtype.tz is not None:
+                df_clean[col] = df_clean[col].dt.tz_localize(None)
+        
+        # Handle complex data types that PyArrow can't handle
+        elif df_clean[col].dtype.name in ['complex', 'complex64', 'complex128']:
+            df_clean[col] = df_clean[col].astype(str)
+    
+    return df_clean
+
+
+def _child_run(conn: mp.connection.Connection, which: str, start: str, end: str, class_letter: str) -> None:
     try:
         if which == "fido":
             df = _query_fido_raw(start, end, class_letter)
@@ -427,7 +495,8 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
                 df_to_write = df
 
             # write parquet (either confirmed-empty or real rows)
-            df_to_write.to_parquet(cfile, index=False)
+            df_clean = _clean_dataframe_for_parquet(df_to_write)
+            df_clean.to_parquet(cfile, index=False, engine='pyarrow')
             print(f" ✓ wrote {cfile.name} (rows={len(df_to_write)})", flush=True)
             successful += 1
 
@@ -466,7 +535,9 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
     out_cols = ["start", "peak", "end", "class", "noaa_ar"]
     if not files:
         print("WARN: no chunk files found; writing empty final parquet", flush=True)
-        pd.DataFrame(columns=out_cols).to_parquet(out_path, index=False)
+        empty_df = pd.DataFrame(columns=out_cols)
+        empty_clean = _clean_dataframe_for_parquet(empty_df)
+        empty_clean.to_parquet(out_path, index=False, engine='pyarrow')
         print(f"Wrote: {out_path} (rows=0)", flush=True)
         return
 
@@ -479,12 +550,15 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
 
     if not dfs:
         print("WARN: all chunk files unreadable; writing empty final parquet", flush=True)
-        pd.DataFrame(columns=out_cols).to_parquet(out_path, index=False)
+        empty_df = pd.DataFrame(columns=out_cols)
+        empty_clean = _clean_dataframe_for_parquet(empty_df)
+        empty_clean.to_parquet(out_path, index=False, engine='pyarrow')
         print(f"Wrote: {out_path} (rows=0)", flush=True)
         return
 
     full = pd.concat(dfs, ignore_index=True).drop_duplicates().sort_values("start").reset_index(drop=True)
-    full.to_parquet(out_path, index=False)
+    full_clean = _clean_dataframe_for_parquet(full)
+    full_clean.to_parquet(out_path, index=False, engine='pyarrow')
     print(f"\n[done] combined → {out_path} (rows={len(full)})", flush=True)
 
 
