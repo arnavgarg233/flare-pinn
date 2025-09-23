@@ -1,5 +1,5 @@
-span: {start: "2010-05-01", end: "2015-12-31"}
-cadence_minutes: 12
+span: {start: "2011-01-01", end: "2015-12-31"}
+cadence_minutes: 60
 window_hours: 48
 window_stride_hours: 6
 targets_hours: [6, 12, 24]

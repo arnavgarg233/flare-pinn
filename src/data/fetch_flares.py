@@ -102,17 +102,32 @@ def _clean_dataframe_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
     
     df_clean = df.copy()
     
-    # Convert object columns to string to avoid PyArrow issues
+    # Handle each column type properly
     for col in df_clean.columns:
-        if df_clean[col].dtype == 'object':
-            # Convert to string, handling NaN values
-            df_clean[col] = df_clean[col].astype(str).replace('nan', None)
-        
-        # Handle datetime columns
-        elif 'datetime' in str(df_clean[col].dtype):
+        # Handle datetime columns first
+        if 'datetime' in str(df_clean[col].dtype):
             # Ensure datetime columns are timezone-naive
             if hasattr(df_clean[col].dtype, 'tz') and df_clean[col].dtype.tz is not None:
                 df_clean[col] = df_clean[col].dt.tz_localize(None)
+        
+        # Handle numeric columns
+        elif df_clean[col].dtype.name in ['int64', 'int32', 'float64', 'float32']:
+            # Keep numeric columns as-is, but ensure no inf values
+            df_clean[col] = df_clean[col].replace([float('inf'), float('-inf')], None)
+        
+        # Handle object columns (strings, mixed types)
+        elif df_clean[col].dtype == 'object':
+            # Check if column contains mixed types or just strings
+            sample_values = df_clean[col].dropna().head(10)
+            if len(sample_values) > 0:
+                # If all non-null values are strings, convert to string type
+                if all(isinstance(val, str) for val in sample_values):
+                    df_clean[col] = df_clean[col].astype('string')
+                else:
+                    # For mixed types, convert everything to string to avoid PyArrow issues
+                    df_clean[col] = df_clean[col].astype(str)
+                    # Replace 'nan' strings with None
+                    df_clean[col] = df_clean[col].replace('nan', None)
         
         # Handle complex data types that PyArrow can't handle
         elif df_clean[col].dtype.name in ['complex', 'complex64', 'complex128']:
@@ -496,8 +511,23 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
 
             # write parquet (either confirmed-empty or real rows)
             df_clean = _clean_dataframe_for_parquet(df_to_write)
-            df_clean.to_parquet(cfile, index=False, engine='pyarrow')
-            print(f" ✓ wrote {cfile.name} (rows={len(df_to_write)})", flush=True)
+            
+            # Write to temporary file first, then move atomically
+            temp_file = cfile.with_suffix('.tmp')
+            try:
+                df_clean.to_parquet(temp_file, index=False, engine='pyarrow')
+                # Verify the file was written correctly
+                test_df = pd.read_parquet(temp_file)
+                if len(test_df) != len(df_to_write):
+                    raise ValueError(f"Data integrity check failed: expected {len(df_to_write)} rows, got {len(test_df)}")
+                # Atomic move
+                temp_file.replace(cfile)
+                print(f" ✓ wrote {cfile.name} (rows={len(df_to_write)})", flush=True)
+            except Exception as e:
+                # Clean up temp file on error
+                if temp_file.exists():
+                    temp_file.unlink()
+                raise e
             successful += 1
 
             # clear any prior error marker
@@ -558,8 +588,23 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
 
     full = pd.concat(dfs, ignore_index=True).drop_duplicates().sort_values("start").reset_index(drop=True)
     full_clean = _clean_dataframe_for_parquet(full)
-    full_clean.to_parquet(out_path, index=False, engine='pyarrow')
-    print(f"\n[done] combined → {out_path} (rows={len(full)})", flush=True)
+    
+    # Write final file atomically
+    temp_out = out_path.with_suffix('.tmp')
+    try:
+        full_clean.to_parquet(temp_out, index=False, engine='pyarrow')
+        # Verify the file was written correctly
+        test_df = pd.read_parquet(temp_out)
+        if len(test_df) != len(full):
+            raise ValueError(f"Final file integrity check failed: expected {len(full)} rows, got {len(test_df)}")
+        # Atomic move
+        temp_out.replace(out_path)
+        print(f"\n[done] combined → {out_path} (rows={len(full)})", flush=True)
+    except Exception as e:
+        # Clean up temp file on error
+        if temp_out.exists():
+            temp_out.unlink()
+        raise e
 
 
 if __name__ == "__main__":
