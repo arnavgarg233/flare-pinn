@@ -76,7 +76,7 @@ def fast_sample_stats(arr: np.ndarray, stride: int = 16) -> Dict[str, float]:
     """
     if arr.ndim != 2:
         return {"nan_frac": math.nan, "vmin": math.nan, "vmax": math.nan, "frac_out_5": math.nan}
-    sample = arr[::stride, ::stride].astype(np.float32)0890
+    sample = arr[::stride, ::stride].astype(np.float32)
     finite = np.isfinite(sample)
     total = sample.size
     if total == 0:

@@ -417,11 +417,11 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
     except Exception:
         pass
 
-    cfg = load_cfg(cfg)
-    ensure_dirs(cfg)
+    data_config = load_cfg(cfg)
+    ensure_dirs(data_config)
 
-    start, end = cfg["span"]["start"], cfg["span"]["end"]
-    base_dir = Path(cfg["paths"]["interim_dir"])
+    start, end = data_config.span.start, data_config.span.end
+    base_dir = Path(data_config.paths.interim_dir)
     chunks_dir = base_dir / "hek_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     out_path = base_dir / "flares_hek.parquet"

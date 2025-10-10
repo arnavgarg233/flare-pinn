@@ -9,8 +9,8 @@ from src.utils.common import load_cfg, finite_diff_divergence
 @click.option("--cfg", default="configs/data_train.yaml")
 @click.option("--n", default=200, help="Random sample size.")
 def main(cfg, n):
-    cfg = load_cfg(cfg)
-    meta = pd.read_parquet(Path(cfg["paths"]["interim_dir"]) / "frames_meta.parquet")
+    data_config = load_cfg(cfg)
+    meta = pd.read_parquet(Path(data_config.paths.interim_dir) / "frames_meta.parquet")
     if len(meta) == 0:
         raise SystemExit("frames_meta.parquet missing.")
     sample = meta.sample(min(n, len(meta)), random_state=0)
