@@ -17,6 +17,9 @@ classifier:
   hidden: 128        # Smaller classifier
   dropout: 0.1
   horizons: [6,12,24]
+  loss_type: "focal"   # Use focal loss for class imbalance
+  focal_alpha: 0.25    # Weight for positive class
+  focal_gamma: 3.0     # Focusing parameter (higher = more focus on hard examples)
 
 physics:
   enable: false      # P0 stage: data-driven only for smoke test

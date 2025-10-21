@@ -32,6 +32,26 @@ from src.eval.metrics import (
 )
 
 
+# Focal Loss for class imbalance
+def focal_loss(probs: torch.Tensor, targets: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+    """
+    Focal Loss (Lin et al. 2017) - downweights easy examples, focuses on hard cases.
+    
+    Args:
+        probs: predicted probabilities [B, H] (after sigmoid)
+        targets: ground truth {0,1} [B, H]
+        alpha: weight for positive class (0.25 typical for rare events)
+        gamma: focusing parameter (2.0 standard; higher = more focus on hard examples)
+    
+    Used in solar flare prediction for rare event detection (~5-10% positive rate).
+    """
+    bce = nn.functional.binary_cross_entropy(probs, targets, reduction='none')
+    p_t = probs * targets + (1 - probs) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    focal_weight = (1 - p_t) ** gamma
+    return (alpha_t * focal_weight * bce).mean()
+
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -47,6 +67,9 @@ class TrainConfig:
     amp: bool = True
     log_every: int = 25
     eval_every: int = 500
+    loss_type: str = "focal"  # "bce" or "focal"
+    focal_alpha: float = 0.25
+    focal_gamma: float = 2.0
 
 
 def set_seed(seed: int) -> None:
@@ -73,6 +96,9 @@ def load_config(path: str) -> TrainConfig:
         amp=bool(train.get("amp", True)),
         log_every=int(train.get("log_every", 25)),
         eval_every=int(train.get("eval_every", 500)),
+        loss_type=str(classifier.get("loss_type", "focal")),
+        focal_alpha=float(classifier.get("focal_alpha", 0.25)),
+        focal_gamma=float(classifier.get("focal_gamma", 2.0)),
     )
 
 
@@ -150,8 +176,12 @@ def train_loop(cfg: TrainConfig, model: nn.Module, loader: torch.utils.data.Data
                 out = model(inputs)
                 logits = out["logits"]                  # [B, H]
                 probs = torch.sigmoid(logits)
-                # Use your preferred loss; BCE shown here for template
-                loss = torch.nn.functional.binary_cross_entropy(probs, labels, reduction="mean")
+                
+                # Loss: Focal (for class imbalance) or BCE
+                if cfg.loss_type == "focal":
+                    loss = focal_loss(probs, labels, alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
+                else:
+                    loss = torch.nn.functional.binary_cross_entropy(probs, labels, reduction="mean")
 
             scaler.scale(loss).backward()
             if cfg.grad_clip and cfg.grad_clip > 0:
