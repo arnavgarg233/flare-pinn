@@ -1,5 +1,5 @@
 name: flare-pinn
-channels: [conda-forge, defaults]
+channels: [conda-forge, defaults, pytorch]
 dependencies:
   - python=3.11
   - pip
@@ -18,5 +18,9 @@ dependencies:
   - pydantic
   - pyyaml
   - click
+  - matplotlib
+  - pytorch
+  - pytorch-cuda=11.8  # adjust to your CUDA version or remove for CPU
   - pip:
       - parfive  # used by sunpy downloads
+      - einops   # optional but useful for tensor operations

@@ -1,7 +1,6 @@
 # src/data/fetch_flares.py
 from __future__ import annotations
 
-import glob
 import multiprocessing as mp
 import os
 import random
@@ -561,7 +560,7 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
     print(f" skipped:    {skipped}", flush=True)
 
     # combine
-    files = sorted(glob.glob(str(chunks_dir / f"{class_letter}_*.parquet")))
+    files = sorted(chunks_dir.glob(f"{class_letter}_*.parquet"))
     out_cols = ["start", "peak", "end", "class", "noaa_ar"]
     if not files:
         print("WARN: no chunk files found; writing empty final parquet", flush=True)
@@ -576,7 +575,7 @@ def main(cfg, class_min, chunk_months, timeout, retries, min_days, sleep_base,
         try:
             dfs.append(pd.read_parquet(f))
         except Exception as e:
-            print(f" skip broken file {Path(f).name}: {e}", flush=True)
+            print(f" skip broken file {f.name}: {e}", flush=True)
 
     if not dfs:
         print("WARN: all chunk files unreadable; writing empty final parquet", flush=True)

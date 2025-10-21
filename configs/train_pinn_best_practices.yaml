@@ -1,0 +1,84 @@
+# configs/train_pinn_best_practices.yaml
+# Based on best practices from solar flare prediction literature:
+# - Deep Flare Net (Nishizuka et al. 2021)
+# - Transformer Networks (Pelkum Donahue & Inceoglu 2024)
+# - Machine Learning in Solar Physics (Campi et al. 2023)
+
+seed: 42
+device: "cpu"  # Change to "cuda" if GPU available
+
+model:
+  hidden: 256
+  layers: 6
+  learn_eta: false
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 4
+    ramp_frac: 0.5
+
+classifier:
+  hidden: 128
+  dropout: 0.1
+  horizons: [6,12,24]
+  
+  # ========== CLASS IMBALANCE HANDLING (Best Practices) ========== #
+  # Option 1: Focal Loss (recommended for rare event detection)
+  loss_type: "focal"           # "bce", "weighted_bce", or "focal"
+  focal_alpha: 0.25            # Weight for positive class (0.25 = emphasize rare positives)
+  focal_gamma: 2.0             # Focusing parameter (2.0 standard, higher = focus more on hard examples)
+  
+  # Option 2: Weighted BCE (alternative, simpler)
+  # loss_type: "weighted_bce"
+  # pos_weight: 9.0            # Or "auto" to compute N_neg/N_pos dynamically
+  
+  # Option 3: Standard BCE (no class balancing - not recommended for imbalanced data)
+  # loss_type: "bce"
+
+physics:
+  enable: false              # P0 stage: data-driven only
+  resistive: false
+  boundary_terms: false
+  lambda_phys_schedule:
+    - [0.00, 0.0]
+    - [0.30, 0.0]
+    - [0.80, 2.0]
+    - [1.00, 3.0]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+
+collocation:
+  n_max: 20000
+  alpha_start: 0.5
+  alpha_end: 0.8
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 1000              # ~30 min smoke test
+  batch_size: 2
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: false
+  log_every: 20
+  eval_every: 100          # Metrics + optimal threshold search
+
+data:
+  use_real: false          # Dummy data for smoke test
+  T: 8
+  H: 64
+  W: 64
+
+# ========== EXPECTED TSS BENCHMARKS (from literature) ========== #
+# All-clear baseline (predict all non-flaring): TSS ≈ 0.0
+# Simple ML (logistic regression on SHARP params): TSS ≈ 0.3-0.5
+# Deep learning (CNNs, LSTMs): TSS ≈ 0.5-0.7
+# SOTA models (transformers, ensemble): TSS ≈ 0.6-0.8
+# 
+# Target for this PINN: TSS > 0.5 (competitive with deep learning)
+

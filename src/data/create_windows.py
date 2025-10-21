@@ -57,6 +57,7 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from src.utils.common import load_cfg, DataConfig
+from src.data.spatial_temporal_matching import spatial_temporal_match, combine_mappings
 
 
 # ===================== Pydantic Models =====================
@@ -115,13 +116,10 @@ def _read_any(path: str) -> pd.DataFrame:
 
 def _load_flares_from_chunks(chunks_dir: Path, start_year: int, end_year: int) -> pd.DataFrame:
     """Load flares from monthly chunk files for the specified year range."""
-    import glob
-    
     # Find all M-class chunk files for the year range
     all_chunks = []
     for year in range(start_year, end_year + 1):
-        pattern = str(chunks_dir / f"M_{year}-*.parquet")
-        year_chunks = glob.glob(pattern)
+        year_chunks = list(chunks_dir.glob(f"M_{year}-*.parquet"))
         all_chunks.extend(year_chunks)
     
     print(f"    Found {len(all_chunks)} chunk files for years {start_year}-{end_year}")
@@ -136,7 +134,7 @@ def _load_flares_from_chunks(chunks_dir: Path, start_year: int, end_year: int) -
             if len(df) > 0:
                 dfs.append(df)
         except Exception as e:
-            print(f"    Warning: Could not read {Path(chunk_file).name}: {e}")
+            print(f"    Warning: Could not read {chunk_file.name}: {e}")
             continue
     
     if not dfs:
@@ -210,20 +208,38 @@ def build_windows(
     # Load HARP-NOAA mapping if provided
     if harp_noaa_mapping is not None and len(harp_noaa_mapping) > 0:
         print(f"  Using HARP-NOAA mapping ({len(harp_noaa_mapping)} entries)")
-        # Create dictionary for fast lookup: NOAA_AR -> list of HARPs
+        
+        # Create BOTH directions for efficient lookup
+        # NOAA_AR -> list of HARPs (for forward lookup)
         noaa_to_harps = {}
+        # HARP -> list of NOAA ARs (for reverse lookup - more efficient)
+        harp_to_noaas = {}
+        
         for _, row in harp_noaa_mapping.iterrows():
             noaa_ar = int(row['noaa_ar'])
             harp = int(row['harpnum'])
+            
+            # Forward mapping
             if noaa_ar not in noaa_to_harps:
                 noaa_to_harps[noaa_ar] = []
             noaa_to_harps[noaa_ar].append(harp)
+            
+            # Reverse mapping (more efficient for per-HARP loop)
+            if harp not in harp_to_noaas:
+                harp_to_noaas[harp] = []
+            harp_to_noaas[harp].append(noaa_ar)
         
         # Convert event NOAA ARs to numeric
         ev["_noaa_ar_num"] = pd.to_numeric(ev[event_cols.noaa_ar], errors='coerce')
+        
+        # Report mapping statistics
+        harps_with_noaa = len(harp_to_noaas)
+        noaas_with_harp = len(noaa_to_harps)
+        print(f"    {harps_with_noaa} HARPs mapped to {noaas_with_harp} NOAA ARs")
     else:
         print(f"  ⚠️  No HARP-NOAA mapping provided - labels will be 0%")
         noaa_to_harps = {}
+        harp_to_noaas = {}
         ev["_noaa_ar_num"] = None
 
     # Group frames by HARP
@@ -267,16 +283,16 @@ def build_windows(
             (ev[event_cols.start] <= ev_window_max + pd.Timedelta(days=2))
         ]
 
-        # Match events using HARP-NOAA mapping
+        # Match events using HARP-NOAA mapping (improved efficiency)
         if harp_noaa_mapping is not None and len(harp_noaa_mapping) > 0:
-            # Find which NOAA ARs map to this HARP
-            # Note: noaa_to_harps maps NOAA_AR -> [HARPs], but we need reverse
-            this_harp_noaa_ars = [noaa for noaa, harps in noaa_to_harps.items() if int(harp_key) in harps]
+            # Use precomputed reverse mapping: HARP -> NOAA ARs
+            this_harp_noaa_ars = harp_to_noaas.get(int(harp_key), [])
             
             # Get events that match any of these NOAA ARs
             if len(this_harp_noaa_ars) > 0:
                 ev_exact = ev_harp[ev_harp["_noaa_ar_num"].isin(this_harp_noaa_ars)]
             else:
+                # This HARP has no NOAA AR mapping - no events can be matched
                 ev_exact = pd.DataFrame(columns=ev_harp.columns)
         else:
             ev_exact = pd.DataFrame(columns=ev_harp.columns)
@@ -307,6 +323,11 @@ def build_windows(
             # Window UID
             window_uid = _stable_uid(str(harp_key), str(pd.Timestamp(t0).isoformat()))
 
+            # Check if this HARP has any NOAA mapping (needed for valid labels)
+            has_noaa_mapping = (harp_noaa_mapping is not None and 
+                               len(harp_noaa_mapping) > 0 and 
+                               int(harp_key) in harp_to_noaas)
+            
             row = {
                 "harpnum": int(harp_key),
                 "t0": pd.Timestamp(t0),
@@ -316,6 +337,7 @@ def build_windows(
                 "frame_count_in_window": frame_count,
                 "obs_coverage": obs_coverage,
                 "window_uid": window_uid,
+                "has_noaa_mapping": bool(has_noaa_mapping),
             }
 
             # Observability & labels per horizon
@@ -395,11 +417,13 @@ def build_windows(
 @click.option("--horizons", type=int, multiple=True, default=None)
 @click.option("--cmd-threshold", type=float, default=None)
 @click.option("--partial-ok-frac", type=float, default=0.70, show_default=True)
+@click.option('--spatial-fallback', is_flag=True, default=False,
+              help='Enable spatial-temporal fallback matching for unmapped HARPs')
 def main(cfg: str, frames: str, events: str, 
          out_suffix: Optional[str], out_ambig: Optional[str],
          use_config_params: bool,
          input_hours: Optional[int], stride_hours: Optional[int], horizons: Optional[Tuple[int, ...]],
-         cmd_threshold: Optional[float], partial_ok_frac: float):
+         cmd_threshold: Optional[float], partial_ok_frac: float, spatial_fallback: bool):
     """Build AR windows + labels for flare forecasting."""
     
     # Load frames once
@@ -426,7 +450,8 @@ def main(cfg: str, frames: str, events: str,
             _process_single_config(
                 cfg_path, split_name, frames_df_all, chunks_dir,
                 out_suffix, out_ambig, use_config_params,
-                input_hours, stride_hours, horizons, cmd_threshold, partial_ok_frac
+                input_hours, stride_hours, horizons, cmd_threshold, partial_ok_frac,
+                spatial_fallback
             )
         return
     
@@ -436,7 +461,8 @@ def main(cfg: str, frames: str, events: str,
     _process_single_config(
         cfg, split_name, frames_df_all, chunks_dir,
         out_suffix, out_ambig, use_config_params,
-        input_hours, stride_hours, horizons, cmd_threshold, partial_ok_frac
+        input_hours, stride_hours, horizons, cmd_threshold, partial_ok_frac,
+        spatial_fallback
     )
 
 
@@ -453,6 +479,7 @@ def _process_single_config(
     horizons: Optional[Tuple[int, ...]],
     cmd_threshold: Optional[float],
     partial_ok_frac: float,
+    spatial_fallback: bool = False,
 ):
     """Process a single config file."""
     print(f"{'='*60}")
@@ -518,6 +545,27 @@ def _process_single_config(
     if mapping_path.exists():
         harp_noaa_mapping = pd.read_parquet(mapping_path)
         print(f"  Loaded HARP-NOAA mapping: {len(harp_noaa_mapping)} entries")
+        
+        # Apply spatial-temporal fallback if requested
+        if spatial_fallback:
+            print(f"\n  Applying spatial-temporal fallback matching...")
+            try:
+                spatial_matches = spatial_temporal_match(
+                    flares_df=events_df,
+                    frames_df=frames_df,
+                    existing_mapping=harp_noaa_mapping,
+                    time_window_hours=1.0,
+                    margin_deg=5.0
+                )
+                
+                if len(spatial_matches) > 0:
+                    harp_noaa_mapping = combine_mappings(harp_noaa_mapping, spatial_matches)
+                    print(f"  Enhanced mapping: {len(harp_noaa_mapping)} total entries")
+                else:
+                    print(f"  No additional spatial matches found")
+            except Exception as e:
+                print(f"  WARNING: Spatial matching failed: {e}")
+                print(f"  Continuing with ID-based mapping only")
     else:
         print(f"  ⚠️  HARP-NOAA mapping not found at {mapping_path}")
         harp_noaa_mapping = None
@@ -541,12 +589,12 @@ def _process_single_config(
     
     windows_path = interim_dir / f"windows_{split_name}.parquet"
     windows_df.to_parquet(windows_path, index=False)
-    print(f"\n✓ Wrote: {windows_path}  (rows={len(windows_df)})")
+    print(f"\n[OK] Wrote: {windows_path}  (rows={len(windows_df)})")
     
     if out_ambig and not amb_df.empty:
         amb_path = interim_dir / f"ambiguous_{split_name}.csv"
         amb_df.to_csv(amb_path, index=False)
-        print(f"✓ Wrote ambiguous: {amb_path}  (rows={len(amb_df)})")
+        print(f"[OK] Wrote ambiguous: {amb_path}  (rows={len(amb_df)})")
     
     # Summary statistics
     if not windows_df.empty:
@@ -556,12 +604,32 @@ def _process_single_config(
         print(f"  Avg frames/window: {windows_df['frame_count_in_window'].mean():.1f}")
         print(f"  Avg obs coverage: {windows_df['obs_coverage'].mean():.2%}")
         
+        # Label coverage analysis
+        if 'has_noaa_mapping' in windows_df.columns:
+            n_labeled = windows_df['has_noaa_mapping'].sum()
+            pct_labeled = 100.0 * n_labeled / len(windows_df)
+            print(f"\n[Label Coverage]")
+            print(f"  Windows with NOAA mapping: {n_labeled}/{len(windows_df)} ({pct_labeled:.1f}%)")
+            print(f"  WARNING: Train only on has_noaa_mapping==True to avoid false negatives!")
+        
         for H in window_config.horizons:
             y_col = f"y_geq_M_{H}h"
             if y_col in windows_df.columns:
+                # Overall stats
                 n_pos = windows_df[y_col].sum()
                 pct_pos = 100.0 * n_pos / len(windows_df) if len(windows_df) > 0 else 0.0
-                print(f"  {H}h horizon: {n_pos} positive ({pct_pos:.2f}%)")
+                
+                # Stats for labeled subset only
+                if 'has_noaa_mapping' in windows_df.columns:
+                    labeled_df = windows_df[windows_df['has_noaa_mapping']]
+                    if len(labeled_df) > 0:
+                        n_pos_labeled = labeled_df[y_col].sum()
+                        pct_pos_labeled = 100.0 * n_pos_labeled / len(labeled_df)
+                        print(f"  {H}h horizon: {n_pos} positive ({pct_pos:.2f}% overall, {pct_pos_labeled:.2f}% in labeled subset)")
+                    else:
+                        print(f"  {H}h horizon: {n_pos} positive ({pct_pos:.2f}%)")
+                else:
+                    print(f"  {H}h horizon: {n_pos} positive ({pct_pos:.2f}%)")
     print()
 
 

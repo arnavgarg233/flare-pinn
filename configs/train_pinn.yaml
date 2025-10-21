@@ -1,0 +1,69 @@
+# configs/train_pinn.yaml
+seed: 42
+device: "cpu"  # Change to "cuda" if GPU available
+
+# stage control (use the schedule below instead of hard on/off):
+# P0: physics.enable=false
+# P1: physics.enable=true, resistive=false
+# P3: physics.enable=true, resistive=true, model.learn_eta=false
+# P4s: physics.enable=true, resistive=true, model.learn_eta=true
+
+model:
+  hidden: 384
+  layers: 10
+  learn_eta: false      # set true for P4s (after scalar warm-start)
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 5
+    ramp_frac: 0.6
+
+classifier:
+  hidden: 256
+  dropout: 0.1
+  horizons: [6,12,24]
+
+physics:
+  enable: false         # P0=false; P1/P3/P4s=true
+  resistive: false      # P3/P4s=true
+  boundary_terms: false
+  lambda_phys_schedule:
+    - [0.00, 0.0]
+    - [0.30, 0.0]
+    - [0.80, 3.0]
+    - [1.00, 5.0]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+
+collocation:
+  n_max: 50000
+  alpha_start: 0.5
+  alpha_end: 0.8
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 100      # Quick smoke test (change to 5000+ for real training)
+  batch_size: 1
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: false      # Disable AMP for CPU
+  log_every: 10
+
+data:
+  use_real: false  # Set to true for real SHARP data
+  # Real data paths (uncomment when use_real=true)
+  windows_parquet: "data/interim/windows_train.parquet"
+  npz_root: "S:/flare_forecasting"
+  frames_meta_parquet: "S:/flare_forecasting/frames_meta.parquet"
+  target_size: 256
+  # Dummy data settings (for smoke tests)
+  T: 8
+  H: 64
+  W: 64
+
