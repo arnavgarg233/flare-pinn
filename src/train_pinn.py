@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from src.models.pinn.core import PINNBackbone, ClassifierHead, B_perp_from_Az
 from src.models.pinn.physics import WeakFormInduction2p5D
 from src.models.pinn.collocation import mix_pil_uniform, clip_and_renorm_importance, ess
+from src.eval.metrics import pr_auc, brier_score, adaptive_ece, sweep_tss, select_threshold_at_far
 
 
 # ------------------------------- utils -------------------------------
@@ -192,7 +193,7 @@ def main():
     batch_size = int(cfg["train"]["batch_size"])
     grad_clip = float(cfg["train"]["grad_clip"])
     log_every = int(cfg["train"].get("log_every", 20))
-    eval_every = int(cfg["train"].get("eval_every", 0)) or None
+    eval_every = int(cfg["train"].get("eval_every", 100))  # Eval metrics every 100 steps by default
 
     # Fourier ramp settings
     ff_max_log2 = int(cfg["model"]["fourier"]["max_log2_freq"])
@@ -233,7 +234,7 @@ def main():
         # Mix PIL/uniform schedule alpha
         alpha_colloc = alpha_start + (alpha_end - alpha_start) * step_frac
 
-        opt.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=use_amp):
             # -------- batch (dummy) --------
@@ -274,14 +275,14 @@ def main():
                     eta_mode=eta_mode,
                     eta_scalar=float(cfg["model"].get("eta_scalar", 0.01)),
                 )
-            else:
+                else:
                 loss_phys, clip_thr = torch.tensor(0.0, device=device), 0.0
 
             loss = w_cls * loss_cls + w_data * loss_data + float(lam_phys) * loss_phys
 
-        scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
         if grad_clip > 0:
-            scaler.unscale_(opt)
+                scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(clf.parameters()), grad_clip)
         scaler.step(opt)
         scaler.update()
@@ -296,8 +297,34 @@ def main():
                 msg += f" imp_clip≤{clip_thr:.2e} ESS≈{ess(torch.ones(n_colloc,1,device=device)):.1f}"
             print(msg)
             t0 = time.time()
-
-        # (Optional) cheap eval hooks could go here; for now keep loop tight.
+        
+        # ---------- EVAL HOOK (compute metrics every eval_every steps) ----------
+        if eval_every and (step % eval_every == 0 or step == steps):
+                with torch.no_grad():
+                probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1, len(clf.horizons))
+                y_np  = labels.detach().cpu().numpy().reshape(-1, len(clf.horizons))
+                print(f"\n{'='*70}")
+                print(f"[EVAL @ step {step}] Metrics across {len(y_np)} samples")
+                print(f"{'='*70}")
+                for j, h in enumerate(clf.horizons):
+                    yj = y_np[:, j].astype(float)
+                    pj = probs[:, j].astype(float)
+                    n_pos = int(yj.sum())
+                    n_total = len(yj)
+                    
+                    # Compute metrics only if we have both classes
+                    if n_pos > 0 and n_pos < n_total:
+                        thr, tss_val = sweep_tss(yj, pj, n=256)
+                        thr_far = select_threshold_at_far(yj, pj, max_far=0.05, n=512)
+                        pr = pr_auc(yj, pj)
+                        bs = brier_score(yj, pj)
+                        ece = adaptive_ece(yj, pj, n_bins=10)
+                        print(f"  Horizon {h}h: TSS*={tss_val:.4f}@thr={thr:.3f} | PR-AUC={pr:.4f} | Brier={bs:.4f} | ECE={ece:.4f}")
+                        print(f"    thr@FAR≤5%={thr_far:.3f} | Class balance: {n_pos}/{n_total} ({100*n_pos/n_total:.1f}% positive)")
+                        else:
+                        print(f"  Horizon {h}h: Skipped (needs mixed classes, {n_pos}/{n_total} positive)")
+                print(f"{'='*70}\n")
+        # -------------------------------------------------------------------------
 
     print("Training run complete. Tip: switch to configs/train_pinn_real.yaml once your data windows are ready.")
 
