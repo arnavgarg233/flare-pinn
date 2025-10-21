@@ -1,0 +1,64 @@
+# configs/train_pinn_smoke_test.yaml
+# 30-minute smoke test with TSS metrics
+
+seed: 42
+device: "cpu"  # Change to "cuda" if GPU available
+
+model:
+  hidden: 256        # Smaller for faster training
+  layers: 6          # Fewer layers
+  learn_eta: false
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 4  # Fewer frequencies
+    ramp_frac: 0.5
+
+classifier:
+  hidden: 128        # Smaller classifier
+  dropout: 0.1
+  horizons: [6,12,24]
+  loss_type: "focal"   # Use focal loss for class imbalance
+  focal_alpha: 0.25    # Weight for positive class
+  focal_gamma: 3.0     # Focusing parameter (higher = more focus on hard examples)
+
+physics:
+  enable: false      # P0 stage: data-driven only for smoke test
+  resistive: false
+  boundary_terms: false
+  lambda_phys_schedule:
+    - [0.00, 0.0]
+    - [0.30, 0.0]
+    - [0.80, 2.0]
+    - [1.00, 3.0]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+
+collocation:
+  n_max: 20000       # Fewer points for speed
+  alpha_start: 0.5
+  alpha_end: 0.8
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 1000        # ~30 mins @ ~2 sec/step
+  batch_size: 2      # Small batch
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: false
+  log_every: 20
+  eval_every: 100    # Metrics every 100 steps
+
+data:
+  use_real: false    # Dummy data for smoke test
+  # Dummy data settings
+  T: 8
+  H: 64              # Small spatial grid
+  W: 64
+
