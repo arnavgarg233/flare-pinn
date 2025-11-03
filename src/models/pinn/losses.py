@@ -2,9 +2,9 @@
 from __future__ import annotations
 import torch
 import torch.nn.functional as F
-from typing import List
+from typing import Optional
 
-def interp_schedule(schedule: List[List[float]], frac: float) -> float:
+def interp_schedule(schedule: list[list[float]], frac: float) -> float:
     """
     schedule = [[x0,y0], [x1,y1], ..., [1.0,y_end]]; piecewise-linear.
     """
@@ -17,7 +17,7 @@ def interp_schedule(schedule: List[List[float]], frac: float) -> float:
             return float(y0*(1-t) + y1*t)
     return float(pts[-1][1])
 
-def bce_logits(y_hat: torch.Tensor, y: torch.Tensor, pos_weight: float | None = None) -> torch.Tensor:
+def bce_logits(y_hat: torch.Tensor, y: torch.Tensor, pos_weight: Optional[float] = None) -> torch.Tensor:
     """
     Binary cross-entropy with logits. 
     pos_weight: weight for positive class (typically N_neg/N_pos, e.g. 5-20 for solar flares)
@@ -53,13 +53,20 @@ def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma:
     loss = alpha_t * focal_weight * bce_loss
     return loss.mean()
 
-def l1_data(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+def l1_data(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if mask is not None:
         w = mask.float()
         return (w * (pred - target).abs()).sum() / w.sum().clamp_min(1.0)
     return (pred - target).abs().mean()
 
-def curl_consistency_l1(B_perp_from_Az_fn, A_z_points, coords_points, Bx_obs=None, By_obs=None, weight: float = 0.1) -> torch.Tensor:
+def curl_consistency_l1(
+    B_perp_from_Az_fn,
+    A_z_points: torch.Tensor,
+    coords_points: torch.Tensor,
+    Bx_obs: Optional[torch.Tensor] = None,
+    By_obs: Optional[torch.Tensor] = None,
+    weight: float = 0.1
+) -> torch.Tensor:
     if Bx_obs is None or By_obs is None or weight <= 0: 
         return A_z_points.new_tensor(0.0)
     Bx, By = B_perp_from_Az_fn(A_z_points, coords_points)

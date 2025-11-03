@@ -1,0 +1,75 @@
+# CPU Smoke Test Config - Fast local verification
+# Goal: Verify code works end-to-end in ~15-30 minutes
+
+seed: 42
+device: "cpu"
+
+model:
+  hidden: 256           # Smaller (384 in production)
+  layers: 6             # Fewer (10 in production)
+  learn_eta: false
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 4    # Lower (5 in production)
+    ramp_frac: 0.5
+
+classifier:
+  hidden: 128           # Smaller (256 in production)
+  dropout: 0.1
+  horizons: [6, 12, 24]
+  loss_type: "focal"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  pos_weight: null
+
+physics:
+  enable: true          # Test with physics ON
+  resistive: false      # Keep it simple for smoke test
+  boundary_terms: false
+  lambda_phys_schedule:
+    - [0.0, 0.0]        # Data-only for first 30%
+    - [0.3, 0.0]
+    - [0.8, 1.0]        # Lower weight (3.0 in production)
+    - [1.0, 1.5]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.0
+
+collocation:
+  n_max: 5000           # Much smaller (20000 in production)
+  alpha_start: 0.5
+  alpha_end: 0.8
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 500            # Quick test (5000 in production)
+  batch_size: 1
+  lr: 5.0e-4            # Lower LR for stability
+  grad_clip: 0.5        # Stronger clipping
+  amp: false            # CPU doesn't support AMP
+  log_every: 25
+  eval_every: 100
+  checkpoint_every: 500
+  checkpoint_dir: "checkpoints/cpu_smoke_test"
+
+data:
+  use_real: true
+  windows_parquet: "data/interim/windows_train.parquet"
+  frames_meta_parquet: "S:/flare_forecasting/frames_meta.parquet"
+  npz_root: "S:/flare_forecasting"
+  target_size: 256
+  input_hours: 48
+  P_per_t: 512          # Fewer points (1024 in production)
+  pil_top_pct: 0.15
+  dummy_T: 8
+  dummy_H: 64
+  dummy_W: 64
+  dummy_num_samples: 2048
+

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple
+from typing import Optional
 
 # ---------------- Fourier Features ---------------- #
 
@@ -67,7 +67,7 @@ class PINNBackbone(nn.Module):
     def set_fourier_alpha(self, a: float) -> None:
         self.ff.set_alpha(a)
 
-    def forward(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, coords: torch.Tensor) -> dict[str, Optional[torch.Tensor]]:
         # coords: [N,3] with requires_grad=True for autograd derivatives
         h = self.ff(coords)
         out = self.net(h)
@@ -81,7 +81,7 @@ class PINNBackbone(nn.Module):
 # ---------------- Helpers (hard in-plane solenoidality) ---------------- #
 
 @torch.enable_grad()
-def B_perp_from_Az(A_z: torch.Tensor, coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def B_perp_from_Az(A_z: torch.Tensor, coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute Bx, By from A_z via B = curl(A_z zhat) => (Bx, By) = (-∂y Az, ∂x Az).
     A_z: [N,1], coords: [N,3] with requires_grad=True
@@ -109,7 +109,7 @@ class ClassifierHead(nn.Module):
         )
         self.horizons = tuple(horizons)
 
-    def forward(self, feats: Dict[str, torch.Tensor], observed_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, feats: dict[str, torch.Tensor], observed_mask: torch.Tensor) -> torch.Tensor:
         """
         feats: dict of tensors shaped [B, T, P, 1] for keys A_z, B_z, u_x, u_y (P = sampled points)
         observed_mask: [B, T] booleans (True for frames t <= t0)

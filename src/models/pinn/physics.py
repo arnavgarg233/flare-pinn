@@ -2,7 +2,7 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple
+from typing import Optional
 
 def _tv1_1d(x: torch.Tensor, weight: float) -> torch.Tensor:
     if weight <= 0: 
@@ -36,7 +36,7 @@ class WeakFormInduction2p5D(nn.Module):
         imp_weights: torch.Tensor,         # [N,1] (renormalized)
         eta_mode: str = "scalar",
         eta_scalar: float = 0.01
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         out = model(coords)
         B_z = out["B_z"]; u_x = out["u_x"]; u_y = out["u_y"]
         # eta
@@ -72,6 +72,17 @@ class WeakFormInduction2p5D(nn.Module):
 
         residual = term_time + term_transport + term_resistive   # [N,1]
         loss_phys = ((residual ** 2) * imp_weights).mean()
+        
+        # DEBUG: Check if loss is unexpectedly zero
+        print(f"⚠️  Physics DEBUG:")
+        print(f"  term_time: {term_time.abs().mean().item():.6e}")
+        print(f"  term_transport: {term_transport.abs().mean().item():.6e}")
+        print(f"  term_resistive: {term_resistive.abs().mean().item():.6e}")
+        print(f"  residual: {residual.abs().mean().item():.6e}")
+        print(f"  residual**2: {(residual ** 2).mean().item():.6e}")
+        print(f"  imp_weights: {imp_weights.mean().item():.6f}")
+        print(f"  loss_phys: {loss_phys.item():.6e}")
+        
         return loss_phys + tv_reg, {
             "phys_loss": float(loss_phys.detach()),
             "tv_eta": float(tv_reg.detach()),

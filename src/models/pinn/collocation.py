@@ -2,10 +2,13 @@
 from __future__ import annotations
 import numpy as np
 import torch
-from typing import Tuple
+from typing import Optional
 
-def sample_xy_from_mask(mask: np.ndarray, n: int, device: str = "cpu") -> torch.Tensor:
+def sample_xy_from_mask(mask: Optional[np.ndarray], n: int, device: str = "cpu") -> torch.Tensor:
     """mask: [H,W] {0,1}; returns (x,y) in [-1,1]^2"""
+    if mask is None:
+        xy = torch.rand(n, 2, device=device) * 2.0 - 1.0
+        return xy
     H, W = mask.shape
     idx = np.flatnonzero(mask.reshape(-1) > 0.5)
     if idx.size == 0:
@@ -21,7 +24,7 @@ def sample_xy_from_mask(mask: np.ndarray, n: int, device: str = "cpu") -> torch.
 
 def mix_pil_uniform(
     H: int, W: int, alpha: float, n_points: int, pil_mask: np.ndarray | None, device: str = "cpu"
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Returns:
       coords: [N,3] in [-1,1]^3 (time uniform over [-1,1])
@@ -47,7 +50,7 @@ def mix_pil_uniform(
     p = torch.full((n_points, 1), p_xy * p_t, device=device)
     return coords, p
 
-def clip_and_renorm_importance(p: torch.Tensor, clip_quantile: float = 0.99) -> Tuple[torch.Tensor, float]:
+def clip_and_renorm_importance(p: torch.Tensor, clip_quantile: float = 0.99) -> tuple[torch.Tensor, float]:
     inv = 1.0 / p.clamp_min(1e-12)
     with torch.no_grad():
         thr = torch.quantile(inv, float(clip_quantile))
