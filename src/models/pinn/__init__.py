@@ -16,6 +16,7 @@ from .losses import focal_loss, bce_logits, l1_data, curl_consistency_l1, interp
 from .physics import WeakFormInduction2p5D
 from .collocation import mix_pil_uniform, clip_and_renorm_importance, ess, sample_xy_from_mask
 from .model import PINNModel, PINNOutput
+from .hybrid_model import HybridPINNModel, HybridPINNOutput
 
 __all__ = [
     # Config
@@ -36,6 +37,9 @@ __all__ = [
     "FourierFeatures",
     "PINNModel",
     "PINNOutput",
+    # Hybrid CNN-PINN
+    "HybridPINNModel",
+    "HybridPINNOutput",
     # Losses
     "focal_loss",
     "bce_logits",

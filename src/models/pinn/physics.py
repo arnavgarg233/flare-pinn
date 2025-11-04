@@ -32,8 +32,7 @@ class WeakFormInduction2p5D(nn.Module):
         self,
         model: nn.Module,
         coords: torch.Tensor,              # [N,3], requires_grad=True
-        quad_wts: torch.Tensor,            # [N,1]
-        imp_weights: torch.Tensor,         # [N,1] (renormalized)
+        imp_weights: torch.Tensor,         # [N,1] (renormalized importance weights)
         eta_mode: str = "scalar",
         eta_scalar: float = 0.01
     ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -63,25 +62,23 @@ class WeakFormInduction2p5D(nn.Module):
         dphi_dx = a[1] + torch.zeros_like(x)
         dphi_dy = a[2] + torch.zeros_like(y)
 
-        term_time       = (phi * dBz_dt) * quad_wts
-        term_transport  = -(dphi_dx * (B_z * u_x) + dphi_dy * (B_z * u_y)) * quad_wts
+        # Weak-form residual terms (WITHOUT quad_wts multiplication to avoid tiny values)
+        # The quad_wts cause the loss to become ~1/N^3, making it ineffective
+        # Instead, we compute the residual at each point and weight by importance
+        term_time       = phi * dBz_dt
+        term_transport  = -(dphi_dx * (B_z * u_x) + dphi_dy * (B_z * u_y))
         if self.use_resistive:
-            term_resistive = (dphi_dx * (eta * dBz_dx) + dphi_dy * (eta * dBz_dy)) * quad_wts
+            term_resistive = (dphi_dx * (eta * dBz_dx) + dphi_dy * (eta * dBz_dy))
         else:
             term_resistive = torch.zeros_like(term_time)
 
         residual = term_time + term_transport + term_resistive   # [N,1]
-        loss_phys = ((residual ** 2) * imp_weights).mean()
         
-        # DEBUG: Check if loss is unexpectedly zero
-        print(f"⚠️  Physics DEBUG:")
-        print(f"  term_time: {term_time.abs().mean().item():.6e}")
-        print(f"  term_transport: {term_transport.abs().mean().item():.6e}")
-        print(f"  term_resistive: {term_resistive.abs().mean().item():.6e}")
-        print(f"  residual: {residual.abs().mean().item():.6e}")
-        print(f"  residual**2: {(residual ** 2).mean().item():.6e}")
-        print(f"  imp_weights: {imp_weights.mean().item():.6f}")
-        print(f"  loss_phys: {loss_phys.item():.6e}")
+        # Importance-weighted mean squared residual
+        # imp_weights are normalized (mean=1), so this is E_p[residual^2]
+        # Scale up by 1e6 to make physics loss competitive with data loss
+        # Typical residual ~ 1e-5, so residual^2 ~ 1e-10 without scaling
+        loss_phys = ((residual ** 2) * imp_weights).mean() * 1e6
         
         return loss_phys + tv_reg, {
             "phys_loss": float(loss_phys.detach()),

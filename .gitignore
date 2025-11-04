@@ -1,13 +1,4 @@
-# Data directories - exclude all data files
-data/
-**/data/
-**/cache/
-**/logs/
-**/raw/
-**/interim/
-**/processed/
-
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -28,67 +19,53 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
-# Virtual environments
-venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-.venv/
+# PyTorch
+*.pt
+*.pth
+*.ckpt
 
-# IDE files
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# Logs
+# Logs and outputs
 *.log
-logs/
+*.out
+*.err
+outputs/logs/*.txt
+outputs/logs/*.log
 
 # Temporary files
 *.tmp
-*.temp
-*.error
+*.bak
+*.cache
 
-# Large data files
-*.parquet
-*.h5
-*.hdf5
-*.pkl
-*.pickle
-*.npy
-*.npz
+# Data (keep structure, ignore large files)
+data/processed/SHARP_1h/**/*.npz
+data/cache/**/*
+!data/cache/.gitkeep
+!data/processed/.gitkeep
 
-# Model files (if you have any)
-*.pth
-*.pt
-*.ckpt
-*.h5
-*.pb
+# Checkpoints (too large for git)
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+!checkpoints/.gitkeep
 
-# Test files (if you don't want them in git)
-test_*.py
-*_test.py
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -56,7 +56,11 @@ def focal_loss(y_hat: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma:
 def l1_data(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if mask is not None:
         w = mask.float()
-        return (w * (pred - target).abs()).sum() / w.sum().clamp_min(1.0)
+        denom = w.sum().clamp_min(1.0)
+        # Return 0 if no valid data (all masked), instead of NaN
+        if denom == 1.0 and w.sum() == 0.0:
+            return pred.new_tensor(0.0)
+        return (w * (pred - target).abs()).sum() / denom
     return (pred - target).abs().mean()
 
 def curl_consistency_l1(

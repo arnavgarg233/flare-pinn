@@ -144,12 +144,22 @@ class PINNModel(nn.Module):
             PINNOutput with predictions, fields, and losses
         """
         device = coords.device
-        B = 1  # Batch size (we typically process 1 window at a time)
         
         # Flatten coords for backbone
         original_shape = coords.shape
         coords_flat = coords.reshape(-1, 3).contiguous()
         coords_flat.requires_grad_(True)
+        
+        # Infer batch size from shape or labels
+        if len(original_shape) == 3:
+            # [T, P, 3] - single sample, batch size = 1
+            T, P = original_shape[0], original_shape[1]
+            B = 1
+        elif len(original_shape) == 4:
+            # [B, T, P, 3] - batched
+            B, T, P = original_shape[0], original_shape[1], original_shape[2]
+        else:
+            raise ValueError(f"Unexpected coords shape: {original_shape}. Expected [T,P,3] or [B,T,P,3]")
         
         # Forward through backbone
         out = self.backbone(coords_flat)
@@ -164,8 +174,7 @@ class PINNModel(nn.Module):
         if self.cfg.loss_weights.curl_consistency > 0 or mode == "eval":
             B_x, B_y = B_perp_from_Az(A_z, coords_flat)
         
-        # Reshape for classifier: [T, P, 1] -> [B, T, P, 1]
-        T, P = original_shape[0], original_shape[1]
+        # Reshape for classifier: flatten -> [B, T, P, 1]
         feats_dict = {
             "A_z": A_z.reshape(B, T, P, 1),
             "B_z": B_z.reshape(B, T, P, 1),
@@ -198,41 +207,78 @@ class PINNModel(nn.Module):
         loss_data = torch.tensor(0.0, device=device)
         if mode == "train" and gt_bz is not None:
             # Mask: only compute loss on observed frames
-            mask_expanded = observed_mask[:, None, None].expand(B, T, P, 1)
-            loss_data = l1_data(feats_dict["B_z"], gt_bz.unsqueeze(0), mask_expanded)
+            # Fix broadcasting: observed_mask is [T], need [B, T, P, 1]
+            if observed_mask.dim() == 1:
+                mask_expanded = observed_mask[None, :, None, None].expand(B, T, P, 1)
+            else:
+                mask_expanded = observed_mask[:, :, None, None].expand(B, T, P, 1)
+            
+            # Ensure gt_bz has batch dimension
+            if gt_bz.dim() == 3:
+                gt_bz = gt_bz.unsqueeze(0)  # [T,P,1] -> [1,T,P,1]
+            loss_data = l1_data(feats_dict["B_z"], gt_bz, mask_expanded)
         
         # 3. Physics loss (weak-form induction)
         loss_phys = torch.tensor(0.0, device=device)
         ess_val = 0.0
         lambda_phys = self.get_lambda_phys()
         
-        if mode == "train" and lambda_phys > 0:
-            print(f"🔍 DEBUG: Computing physics loss (lambda={lambda_phys:.3f})...")
-            # Collocation: resample or use provided coords
-            # For now, assume coords are already sampled; compute importance weights
+        if mode == "train" and lambda_phys > 1e-8:
+            # Collocation: compute PIL-based importance weights
             alpha = self.get_collocation_alpha()
-            
-            # Dummy uniform weights (improve by using mix_pil_uniform in data loader)
             N = coords_flat.shape[0]
-            p_uniform = torch.full((N, 1), 0.25 * 0.5, device=device)  # approx p(x,y,t)
-            imp_weights, _ = clip_and_renorm_importance(p_uniform, self.cfg.collocation.impw_clip_quantile)
-            ess_val = float((imp_weights.sum() ** 2) / (imp_weights ** 2).sum().item())
             
-            # Quadrature weights (uniform grid assumption)
-            quad_wts = torch.ones_like(imp_weights) / N
+            # Use PIL mask if provided, otherwise uniform sampling
+            if pil_mask is not None:
+                # PIL mask is [H, W] numpy array
+                # Sample spatial points biased toward PIL regions
+                from .collocation import mix_pil_uniform
+                H, W = pil_mask.shape
+                
+                # We already have coords sampled, so compute importance weights from PIL mask
+                # Extract spatial coords (x,y) from coords_flat
+                xy_coords = coords_flat[:, :2]  # [N, 2] in [-1, 1]
+                
+                # Convert to pixel coordinates
+                x_px = ((xy_coords[:, 0] + 1.0) * 0.5 * (W - 1)).long().clamp(0, W-1)
+                y_px = ((xy_coords[:, 1] + 1.0) * 0.5 * (H - 1)).long().clamp(0, H-1)
+                
+                # Get PIL mask values at sampled points
+                pil_values = torch.from_numpy(pil_mask[y_px.cpu().numpy(), x_px.cpu().numpy()]).to(device).float()
+                
+                # Compute mixture probability: p = alpha * p_pil + (1-alpha) * p_uniform
+                p_uniform_xy = 0.25  # uniform over [-1,1]^2 has area 4
+                p_uniform_t = 0.5    # uniform over [-1,1] has length 2
+                p_uniform = p_uniform_xy * p_uniform_t  # = 0.125
+                
+                # For PIL regions: mask value indicates importance
+                pil_frac = pil_mask.sum() / (H * W) if pil_mask.sum() > 0 else 1.0
+                p_pil_xy = 1.0 / (4.0 * pil_frac) if pil_frac > 0 else p_uniform_xy
+                p_pil = p_pil_xy * p_uniform_t
+                
+                # Mixture: p(x,y,t) = alpha * p_pil * I_pil(x,y) + (1-alpha) * p_uniform
+                p_spatial = alpha * p_pil * pil_values + (1 - alpha) * p_uniform
+                p_spatial = p_spatial.clamp_min(1e-8)  # Avoid division by zero
+                
+                imp_weights, _ = clip_and_renorm_importance(p_spatial.unsqueeze(-1), self.cfg.collocation.impw_clip_quantile)
+            else:
+                # Fallback: uniform weights
+                p_uniform = torch.full((N, 1), 0.125, device=device)
+                imp_weights, _ = clip_and_renorm_importance(p_uniform, self.cfg.collocation.impw_clip_quantile)
+            
+            # ESS (Effective Sample Size) - measure of sampling efficiency
+            ess_val = float((imp_weights.sum() ** 2) / (imp_weights ** 2).sum().item())
             
             # Compute physics residual
             eta_mode = "field" if self.cfg.model.learn_eta else "scalar"
             loss_phys_raw, phys_info = self.physics(
                 self.backbone,
                 coords_flat,
-                quad_wts,
                 imp_weights,
                 eta_mode=eta_mode,
                 eta_scalar=self.cfg.model.eta_scalar
             )
             loss_phys = lambda_phys * loss_phys_raw
-            print(f"  loss_phys_raw={loss_phys_raw.item():.6f}, scaled={loss_phys.item():.6f}")
         
         # 4. Optional curl consistency loss
         loss_curl = torch.tensor(0.0, device=device)

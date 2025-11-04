@@ -1,0 +1,179 @@
+# src/models/pinn/hybrid_core.py
+"""
+Hybrid CNN-conditioned PINN backbone.
+Combines spatial CNN features with coordinate-based neural fields.
+"""
+from __future__ import annotations
+import torch
+import torch.nn as nn
+from typing import Optional
+
+from .core import FourierFeatures, fourier_out_dim, ClassifierHead
+from .encoder import TinyEncoder
+from .latent_sampling import sample_latent_soft_bilinear, sample_latent_nearest
+from .film import FiLM
+
+
+class HybridPINNBackbone(nn.Module):
+    """
+    Coordinate MLP conditioned by CNN features.
+    
+    Architecture:
+        1. Encode observed frames → (L, g) via TinyEncoder
+        2. For each collocation point (x,y,t):
+           - Compute Fourier features
+           - Sample L at (x,y)
+           - Concatenate [x, y, t, FF, L_sampled, g]
+           - Pass through MLP with FiLM conditioning
+        3. Output: A_z, B_z, u_x, u_y, [eta_raw]
+    
+    This combines:
+        - CNN: Spatial inductive bias (locality, translation equivariance)
+        - PINN: Physics constraints via weak-form residuals
+    """
+    def __init__(
+        self,
+        encoder_in_channels: int,
+        latent_channels: int = 32,
+        global_dim: int = 64,
+        hidden: int = 384,
+        layers: int = 10,
+        max_log2_freq: int = 5,
+        film_layers: tuple[int, ...] = (3, 6, 9),
+        learn_eta: bool = False,
+        encoder_dropout: float = 0.05
+    ):
+        super().__init__()
+        
+        # CNN encoder
+        self.encoder = TinyEncoder(
+            in_channels=encoder_in_channels,
+            latent_channels=latent_channels,
+            global_dim=global_dim,
+            dropout=encoder_dropout
+        )
+        
+        # Fourier features
+        self.ff = FourierFeatures(3, max_log2_freq)
+        ff_dim = fourier_out_dim(3, max_log2_freq)
+        
+        # Input: [x, y, t, FF, L_sampled, g]
+        in_dim = 3 + ff_dim + latent_channels + global_dim
+        out_dim = 5 if learn_eta else 4
+        
+        # Coordinate MLP with FiLM conditioning
+        self.film_layers = set(film_layers)
+        self.layers_list = nn.ModuleList()
+        self.activations = nn.ModuleList()
+        self.film_modules = nn.ModuleDict()
+        
+        # First layer
+        self.layers_list.append(nn.Linear(in_dim, hidden))
+        self.activations.append(nn.SiLU())
+        
+        # Hidden layers with FiLM
+        for i in range(1, layers):
+            self.layers_list.append(nn.Linear(hidden, hidden))
+            self.activations.append(nn.SiLU())
+            if (i + 1) in self.film_layers:  # Layer indexing: 1-based
+                self.film_modules[str(i + 1)] = FiLM(hidden, global_dim)
+        
+        # Output head
+        self.head = nn.Linear(hidden, out_dim)
+        self.learn_eta = learn_eta
+        self.latent_channels = latent_channels
+        self.global_dim = global_dim
+    
+    def set_fourier_alpha(self, a: float) -> None:
+        """Annealing for Fourier features."""
+        self.ff.set_alpha(a)
+    
+    def encode(self, frames_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode observed frames into latent features.
+        
+        Args:
+            frames_obs: [N, C_in, H, W] - Observed Bz frames (t <= t0 only!)
+        
+        Returns:
+            L: [N, C_latent, H, W]
+            g: [N, D_global]
+        """
+        return self.encoder(frames_obs)
+    
+    def forward(
+        self,
+        coords: torch.Tensor,
+        L: torch.Tensor,
+        g: torch.Tensor,
+        use_nearest: bool = False
+    ) -> dict[str, Optional[torch.Tensor]]:
+        """
+        Query neural field at collocation points with CNN conditioning.
+        
+        Args:
+            coords: [N, 3] - Normalized coordinates (x, y, t) in [-1, 1]^3
+            L: [1, C_latent, H, W] - Cached latent map (broadcast to N)
+            g: [1, D_global] - Cached global code (broadcast to N)
+            use_nearest: If True, use nearest-neighbor sampling (faster, no coord gradients)
+        
+        Returns:
+            dict with A_z, B_z, u_x, u_y, eta_raw (each [N, 1])
+            
+        Note:
+            Now uses manual bilinear/nearest sampling that supports 2nd-order gradients.
+            Physics loss can train the CNN encoder end-to-end!
+        """
+        N = coords.shape[0]
+        
+        # Extract spatial coordinates for L sampling
+        xy = coords[:, :2]  # [N, 2]
+        
+        # Reshape for batch processing: [N, 2] -> [1, N, 2] for sampler
+        # The samplers expect [batch, points, 2]
+        xy_batched = xy.unsqueeze(0)  # [1, N, 2]
+        
+        # Sample latent at collocation points with 2nd-order differentiable sampler
+        if use_nearest:
+            L_sampled = sample_latent_nearest(L, xy_batched)  # [1, N, C]
+        else:
+            L_sampled = sample_latent_soft_bilinear(L, xy_batched)  # [1, N, C]
+        
+        L_sampled = L_sampled.squeeze(0)  # [N, C]
+        
+        # Broadcast global code
+        if g.shape[0] == 1:
+            g_expanded = g.expand(N, -1)  # [N, D]
+        else:
+            g_expanded = g
+        
+        # Fourier features
+        ff = self.ff(coords)  # [N, FF_dim]
+        
+        # Concatenate all inputs
+        z = torch.cat([coords, ff, L_sampled, g_expanded], dim=-1)  # [N, in_dim]
+        
+        # Forward through MLP with FiLM
+        h = z
+        for i, (layer, act) in enumerate(zip(self.layers_list, self.activations), start=1):
+            h = act(layer(h))
+            if i in self.film_layers:
+                h = self.film_modules[str(i)](h, g_expanded)
+        
+        # Output head
+        out = self.head(h)
+        
+        if self.learn_eta:
+            A_z, B_z, u_x, u_y, eta_raw = torch.split(out, 1, dim=-1)
+        else:
+            A_z, B_z, u_x, u_y = torch.split(out, 1, dim=-1)
+            eta_raw = None
+        
+        return {
+            "A_z": A_z,
+            "B_z": B_z,
+            "u_x": u_x,
+            "u_y": u_y,
+            "eta_raw": eta_raw
+        }
+

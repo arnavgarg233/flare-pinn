@@ -24,6 +24,7 @@ class FourierConfig(BaseModel):
 
 class ModelConfig(BaseModel):
     """PINN backbone configuration."""
+    model_type: Literal["mlp", "hybrid"] = Field(default="mlp", description="Model architecture: 'mlp' (pure coordinate) or 'hybrid' (CNN+MLP)")
     hidden: int = Field(default=384, ge=64, le=2048, description="Hidden dimension for MLP")
     layers: int = Field(default=10, ge=2, le=20, description="Number of hidden layers")
     learn_eta: bool = Field(default=False, description="Learn spatially-varying resistivity η(x,y,t)")
