@@ -1,0 +1,86 @@
+# Improved 5K training config with Pydantic validation
+# ~2-3 hours training time on GPU
+
+seed: 42
+device: "mps"  # Options: "cpu", "cuda", "mps" (Apple Silicon GPU)
+
+model:
+  model_type: "mlp"  # Pure coordinate-based PINN
+  hidden: 384
+  layers: 10
+  learn_eta: false
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 5
+    ramp_frac: 0.5
+
+classifier:
+  hidden: 256
+  dropout: 0.1
+  horizons: [6, 12, 24]
+  loss_type: "focal"
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  pos_weight: null  # Auto-balance or set to N_neg/N_pos (e.g., 10.0)
+
+physics:
+  enable: true
+  resistive: false
+  boundary_terms: false
+  # Conservative schedule for 5K steps
+  lambda_phys_schedule:
+    - [0.0, 0.0]   # P0: Data-driven only (0-30%)
+    - [0.3, 0.0]   # Ramp start at 30%
+    - [0.6, 0.5]   # Weak physics
+    - [0.8, 1.0]   # Moderate physics
+    - [1.0, 1.5]   # Conservative max for stability
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.0  # Optional: set to 0.1 if you have B_x, B_y observations
+
+collocation:
+  n_max: 20000
+  alpha_start: 0.5
+  alpha_end: 0.8
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 5000
+  batch_size: 1
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: false  # Disable AMP for CPU
+  log_every: 50
+  eval_every: 500
+  checkpoint_every: 1000
+  checkpoint_dir: "checkpoints/5k_cpu_run"
+
+data:
+  use_real: true  # Real SHARP data
+  
+  # Real data paths
+  windows_parquet: "data/interim/windows_train.parquet"
+  frames_meta_parquet: "S:/flare_forecasting/frames_meta.parquet"
+  npz_root: "S:/flare_forecasting"
+  
+  # Common settings
+  target_size: 256
+  input_hours: 48
+  P_per_t: 1024
+  pil_top_pct: 0.15
+  
+  # Dummy data settings (used if use_real=false)
+  dummy_T: 8
+  dummy_H: 64
+  dummy_W: 64
+  dummy_num_samples: 2048
+
+
+
