@@ -30,13 +30,14 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 from src.models.pinn import PINNConfig, PINNModel, PINNOutput, HybridPINNModel, HybridPINNOutput
-from src.eval.metrics import (
+from src.models.eval.metrics import (
     pr_auc,
     brier_score,
     adaptive_ece,
     sweep_tss,
     select_threshold_at_far,
 )
+from src.utils.training_utils import optimize_for_device
 
 
 # ============================================================================
@@ -265,9 +266,12 @@ class PINNTrainer:
         self.cfg = cfg
         self.logger = logger
         
-        # Device setup
-        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        # Device setup with Apple Silicon MPS support
+        self.device = self._get_device(cfg.device)
         self.logger.info(f"Using device: {self.device}")
+        
+        # Apply device-specific optimizations
+        optimize_for_device(self.device)
         
         # Model selection based on config
         model_type = cfg.model.model_type
@@ -284,10 +288,9 @@ class PINNTrainer:
         # Optimizer
         self.optimizer = optim.AdamW(self.model.parameters(), lr=cfg.train.lr)
         
-        # AMP scaler
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=cfg.train.amp and self.device.type == "cuda"
-        )
+        # AMP scaler (only for CUDA; MPS doesn't use GradScaler)
+        self.use_amp = cfg.train.amp and self.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         
         # Checkpointing
         self.checkpoint_mgr: Optional[CheckpointManager] = None
@@ -300,6 +303,31 @@ class PINNTrainer:
         # State
         self.step = 0
         self.epoch = 0
+    
+    def _get_device(self, requested_device: str) -> torch.device:
+        """
+        Get the best available device, with support for CUDA, MPS (Apple Silicon), and CPU.
+        
+        Args:
+            requested_device: Device string from config (e.g., "cuda", "mps", "cpu")
+        
+        Returns:
+            torch.device object
+        """
+        if requested_device.startswith("cuda"):
+            if torch.cuda.is_available():
+                return torch.device(requested_device)
+            else:
+                self.logger.warning(f"CUDA requested but not available, falling back to CPU")
+                return torch.device("cpu")
+        elif requested_device == "mps":
+            if torch.backends.mps.is_available():
+                return torch.device("mps")
+            else:
+                self.logger.warning(f"MPS requested but not available, falling back to CPU")
+                return torch.device("cpu")
+        else:
+            return torch.device(requested_device)
     
     def set_seed(self, seed: int):
         """Set random seeds for reproducibility."""
@@ -328,10 +356,15 @@ class PINNTrainer:
         # Forward pass
         self.optimizer.zero_grad(set_to_none=True)
         
+        # Use autocast appropriately based on device
+        # MPS supports autocast but uses different dtypes
+        autocast_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        use_autocast = self.use_amp or (self.device.type == "mps" and self.cfg.train.amp)
+        
         with torch.autocast(
             device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.cfg.train.amp and self.device.type == "cuda"
+            dtype=autocast_dtype,
+            enabled=use_autocast
         ):
             # Handle batch dimension
             # Dataset returns: coords [T, P, 3], DataLoader batches to [B, T, P, 3]
@@ -376,19 +409,33 @@ class PINNTrainer:
             labels_all = torch.cat(batch_labels, dim=0)
         
         # Backward pass
-        # NEW: Single backward pass for all models (hybrid fixed with soft-bilinear sampler!)
-        self.scaler.scale(loss).backward()
-        
-        # Gradient clipping
-        if self.cfg.train.grad_clip > 0:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.cfg.train.grad_clip
-            )
-        
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        # Handle differently for CUDA (with GradScaler) vs MPS/CPU (without GradScaler)
+        if self.use_amp:
+            # CUDA with AMP
+            self.scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            if self.cfg.train.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.cfg.train.grad_clip
+                )
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # MPS or CPU (no GradScaler)
+            loss.backward()
+            
+            # Gradient clipping
+            if self.cfg.train.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.cfg.train.grad_clip
+                )
+            
+            self.optimizer.step()
         
         # Collect metrics
         with torch.no_grad():

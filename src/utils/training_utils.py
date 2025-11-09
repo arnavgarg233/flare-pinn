@@ -14,6 +14,72 @@ import torch.nn as nn
 
 
 # ============================================================================
+# Device Management
+# ============================================================================
+
+def get_optimal_device(prefer_gpu: bool = True, logger: Optional[logging.Logger] = None) -> torch.device:
+    """
+    Automatically detect and return the best available device.
+    
+    Checks in order:
+    1. CUDA (NVIDIA GPUs)
+    2. MPS (Apple Silicon GPUs)
+    3. CPU (fallback)
+    
+    Args:
+        prefer_gpu: If True, prefer GPU over CPU when available
+        logger: Optional logger for device info messages
+    
+    Returns:
+        torch.device: The best available device
+    """
+    if prefer_gpu:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            if logger:
+                logger.info(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+                logger.info(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            return device
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+            if logger:
+                logger.info("Using Apple Silicon GPU (MPS)")
+                logger.info("Note: MPS backend is optimized for M1/M2/M3 chips")
+            return device
+    
+    device = torch.device("cpu")
+    if logger:
+        logger.info("Using CPU")
+    return device
+
+
+def optimize_for_device(device: torch.device):
+    """
+    Apply device-specific optimizations.
+    
+    Args:
+        device: The target device
+    """
+    if device.type == "cuda":
+        # Enable TF32 on Ampere+ GPUs (A100, RTX 3090, etc.)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Enable cuDNN autotuner
+        torch.backends.cudnn.benchmark = True
+    
+    elif device.type == "mps":
+        # MPS-specific optimizations
+        # Note: MPS backend automatically handles memory management
+        # No specific optimizations needed currently
+        pass
+    
+    # CPU optimizations
+    # Set number of threads for optimal CPU performance
+    # torch.set_num_threads() can be called before training if needed
+
+
+# ============================================================================
 # Error Handling & Validation
 # ============================================================================
 
@@ -102,7 +168,7 @@ def check_gradient_health(
 @contextmanager
 def catch_cuda_oom(logger: Optional[logging.Logger] = None):
     """
-    Context manager to catch and handle CUDA OOM errors gracefully.
+    Context manager to catch and handle GPU OOM errors gracefully (CUDA and MPS).
     
     Usage:
         with catch_cuda_oom(logger):
@@ -111,12 +177,26 @@ def catch_cuda_oom(logger: Optional[logging.Logger] = None):
     try:
         yield
     except RuntimeError as e:
-        if "out of memory" in str(e).lower():
+        error_msg = str(e).lower()
+        if "out of memory" in error_msg:
             if logger:
-                logger.error("CUDA out of memory!")
+                device_type = "GPU"
+                if "cuda" in error_msg:
+                    device_type = "CUDA"
+                elif "mps" in error_msg:
+                    device_type = "MPS (Apple Silicon)"
+                
+                logger.error(f"{device_type} out of memory!")
                 logger.error("Try reducing: batch_size, hidden_dim, n_collocation_points")
-            torch.cuda.empty_cache()
-            raise TrainingError("CUDA OOM - reduce model size or batch size") from e
+            
+            # Clear cache based on device
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+            
+            raise TrainingError("GPU OOM - reduce model size or batch size") from e
         else:
             raise
 
@@ -345,36 +425,93 @@ class WarmupCosineSchedule:
 # Memory Optimization
 # ============================================================================
 
-def optimize_memory():
-    """Apply PyTorch memory optimizations."""
-    # Enable TF32 on Ampere GPUs (A100, RTX 3090, etc.)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+def optimize_memory(device: Optional[torch.device] = None):
+    """
+    Apply PyTorch memory optimizations based on device.
     
-    # Enable cuDNN autotuner
-    torch.backends.cudnn.benchmark = True
+    Args:
+        device: Target device (auto-detected if None)
+    """
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     
-    # Enable gradient checkpointing for large models (manual in model code)
+    if device.type == "cuda":
+        # Enable TF32 on Ampere GPUs (A100, RTX 3090, etc.)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Enable cuDNN autotuner
+        torch.backends.cudnn.benchmark = True
+    
+    # MPS doesn't need specific memory optimizations
+    # CPU: Enable gradient checkpointing for large models (manual in model code)
     # This trades compute for memory by recomputing activations
 
 
-def get_memory_stats() -> dict[str, float]:
-    """Get current GPU memory statistics."""
-    if not torch.cuda.is_available():
-        return {}
+def get_memory_stats(device: Optional[torch.device] = None) -> dict[str, float]:
+    """
+    Get current GPU memory statistics.
     
-    return {
-        'allocated_gb': torch.cuda.memory_allocated() / 1e9,
-        'reserved_gb': torch.cuda.memory_reserved() / 1e9,
-        'max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9,
-    }
+    Args:
+        device: Device to get stats for (auto-detected if None)
+    
+    Returns:
+        Dictionary with memory statistics (empty dict if not applicable)
+    """
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            return {}
+    
+    if device.type == "cuda":
+        return {
+            'allocated_gb': torch.cuda.memory_allocated() / 1e9,
+            'reserved_gb': torch.cuda.memory_reserved() / 1e9,
+            'max_allocated_gb': torch.cuda.max_memory_allocated() / 1e9,
+        }
+    elif device.type == "mps":
+        # MPS doesn't expose detailed memory stats like CUDA
+        # Return basic info
+        return {
+            'device': 'mps',
+            'note': 'MPS memory is managed automatically by Metal'
+        }
+    
+    return {}
 
 
-def clear_memory_cache():
-    """Clear GPU memory cache."""
-    if torch.cuda.is_available():
+def clear_memory_cache(device: Optional[torch.device] = None):
+    """
+    Clear GPU memory cache.
+    
+    Args:
+        device: Device to clear cache for (auto-detected if None)
+    """
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            return
+    
+    if device.type == "cuda":
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+    elif device.type == "mps":
+        # MPS automatically manages memory
+        # Force synchronization to complete pending operations
+        torch.mps.synchronize() if hasattr(torch.mps, 'synchronize') else None
+        # Empty cache if available
+        torch.mps.empty_cache() if hasattr(torch.mps, 'empty_cache') else None
 
 
 

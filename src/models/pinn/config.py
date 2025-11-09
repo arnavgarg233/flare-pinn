@@ -159,7 +159,7 @@ class DataConfig(BaseModel):
 class PINNConfig(BaseModel):
     """Complete PINN training configuration."""
     seed: int = Field(default=42, ge=0)
-    device: str = Field(default="cuda", pattern="^(cuda|cpu|cuda:[0-9]+)$")
+    device: str = Field(default="cuda", pattern="^(cuda|cpu|mps|cuda:[0-9]+)$")
     
     model: ModelConfig = Field(default_factory=ModelConfig)
     classifier: ClassifierConfig = Field(default_factory=ClassifierConfig)
