@@ -1,40 +1,40 @@
-# Hybrid CNN-conditioned PINN training config
-# Combines CNN spatial features with physics constraints
-# ~2-3 hours on CPU for 5K steps
+# SOTA-Optimized Hybrid CNN-PINN Config
+# Goal: Beat SOTA (TSS > 0.65 @ 24h) using Physics-Informed Learning
 
 seed: 42
-device: "mps"  # Options: "cpu", "cuda", "mps" (Apple Silicon GPU)
+device: "mps"
 
 model:
-  model_type: "hybrid"  # CNN-conditioned PINN
+  model_type: "hybrid"
   hidden: 384
   layers: 10
-  learn_eta: false
+  learn_eta: true  # Enable learned resistivity
   eta_scalar: 0.01
   fourier:
-    max_log2_freq: 5
-    ramp_frac: 0.5
+    max_log2_freq: 6  # High frequency features for fine detail
+    ramp_frac: 0.2    # Fast ramp to full features
 
 classifier:
   hidden: 256
-  dropout: 0.1
+  dropout: 0.5      # High dropout for regularization
   horizons: [6, 12, 24]
+  extra_features: 5
   loss_type: "focal"
-  focal_alpha: 0.25
+  focal_alpha: 0.85
   focal_gamma: 2.0
   pos_weight: null
 
 physics:
   enable: true
-  resistive: false  # Start without resistive term
+  resistive: true  # Full resistive MHD
   boundary_terms: false
-  # Conservative schedule for hybrid
+  # AGGRESSIVE Physics Schedule: Start early, ramp high
   lambda_phys_schedule:
-    - [0.0, 0.0]   # P0: Data-only warmup
-    - [0.3, 0.0]
-    - [0.6, 0.5]   # P1: Weak physics
-    - [0.8, 1.0]   # P2: Moderate
-    - [1.0, 1.5]   # P3: Full physics (conservative)
+    - [0.0, 0.0]
+    - [0.2, 0.5]   # Start physics at 20% of training
+    - [0.5, 2.0]   # Strong physics by 50%
+    - [0.8, 5.0]   # Very strong constraints
+    - [1.0, 10.0]  # Dominant physics for fine-tuning
 
 eta:
   min: 1.0e-4
@@ -42,38 +42,56 @@ eta:
   tv_weight: 1.0e-3
 
 loss_weights:
-  cls: 1.0
+  cls: 2.0     # Prioritize classification (TSS)
   data: 1.0
-  curl_consistency: 0.0
+  curl_consistency: 0.1
 
 collocation:
-  n_max: 20000
+  n_max: 16384     # High resolution physics sampling
   alpha_start: 0.5
-  alpha_end: 0.8
+  alpha_end: 0.9   # Focus strongly on PILs at end
   impw_clip_quantile: 0.99
 
 train:
-  steps: 5000
+  steps: 30000     # Long training for convergence
   batch_size: 1
-  lr: 1.0e-3
+  lr: 5.0e-4       # Higher learning rate for hybrid
   grad_clip: 1.0
   amp: false
   log_every: 50
-  eval_every: 500
-  checkpoint_every: 1000
-  checkpoint_dir: "checkpoints/hybrid_5k"
+  eval_every: 1000
+  checkpoint_every: 2000
+  checkpoint_dir: "outputs/checkpoints/hybrid_sota"
+  scheduler:
+    type: "cosine"
+    warmup_steps: 2000
+    min_lr: 1.0e-5
+  sampler:
+    strategy: "class_balanced"
+    positive_multiplier: 50.0  # Aggressive oversampling of flares
+    smoothing: 0.8
 
 data:
   use_real: true
   windows_parquet: "data/interim/windows_train.parquet"
-  frames_meta_parquet: "S:/flare_forecasting/frames_meta.parquet"
-  npz_root: "S:/flare_forecasting"
-  target_size: 256
-  input_hours: 48
-  P_per_t: 1024
-  pil_top_pct: 0.15
+  frames_meta_parquet: "/Volumes/Lexar/flare_forecasting/frames_meta.parquet"
+  npz_root: "/Volumes/Lexar/flare_forecasting"
+  target_size: 128   # High resolution input
+  input_hours: 48    # Full history
+  P_per_t: 2048      # Dense spatial sampling
+  pil_top_pct: 0.20  # Focus on active regions
+  
+  # Validation
+  val_fraction: 0.1
+  scalar_features:
+    - frame_count_in_window
+    - obs_coverage
+    - horizon_coverage_6h
+    - horizon_coverage_12h
+    - horizon_coverage_24h
+
+  # Dummy (fallback)
   dummy_T: 8
   dummy_H: 64
   dummy_W: 64
   dummy_num_samples: 2048
-

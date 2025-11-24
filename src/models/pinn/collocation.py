@@ -50,12 +50,36 @@ def mix_pil_uniform(
     p = torch.full((n_points, 1), p_xy * p_t, device=device)
     return coords, p
 
-def clip_and_renorm_importance(p: torch.Tensor, clip_quantile: float = 0.99) -> tuple[torch.Tensor, float]:
+def clip_and_renorm_importance(
+    p: torch.Tensor, 
+    clip_quantile: float = 0.99,
+    max_weight_ratio: float = 100.0  # Hard cap on max/min ratio
+) -> tuple[torch.Tensor, float]:
+    """
+    Clip and renormalize importance weights to prevent extreme values.
+    
+    Args:
+        p: [N, 1] probability values
+        clip_quantile: Quantile for soft clipping
+        max_weight_ratio: Hard cap on max/min weight ratio
+    """
     inv = 1.0 / p.clamp_min(1e-12)
+    
     with torch.no_grad():
+        # Soft clip by quantile
         thr = torch.quantile(inv, float(clip_quantile))
+        
+        # Hard clip to prevent extreme ratios
+        # max_weight_ratio limits how much more important any point can be
+        min_inv = inv.min()
+        hard_thr = min_inv * max_weight_ratio
+        thr = min(thr, hard_thr)
+    
     w = torch.minimum(inv, thr)
-    w_tilde = w / w.mean()
+    
+    # Renormalize so mean = 1
+    w_tilde = w / w.mean().clamp_min(1e-12)
+    
     return w_tilde, float(thr.item())
 
 def ess(weights: torch.Tensor) -> float:

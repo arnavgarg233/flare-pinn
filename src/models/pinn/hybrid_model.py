@@ -5,6 +5,7 @@ Hybrid CNN-conditioned PINN model for solar flare prediction.
 Combines CNN spatial features with physics-informed coordinate fields.
 """
 from __future__ import annotations
+from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 import numpy as np
@@ -15,7 +16,10 @@ from .config import PINNConfig
 from .hybrid_core import HybridPINNBackbone
 from .core import ClassifierHead, B_perp_from_Az
 from .physics import WeakFormInduction2p5D
-from .losses import focal_loss, bce_logits, l1_data, interp_schedule
+from .losses import (
+    focal_loss, focal_loss_with_label_smoothing, bce_logits, l1_data, 
+    interp_schedule, asymmetric_focal_loss, confidence_penalty
+)
 from .collocation import clip_and_renorm_importance
 
 
@@ -73,11 +77,38 @@ class HybridPINNModel(nn.Module):
             encoder_dropout=0.05
         )
         
-        # Classifier head (same as pure PINN)
+        # Load RF importance weights if configured
+        rf_weights = None
+        if cfg.classifier.use_rf_guidance and cfg.classifier.rf_weights_path is not None:
+            rf_weights = self._load_rf_weights(cfg.classifier.rf_weights_path)
+        elif cfg.classifier.use_rf_guidance:
+            # Use default domain-knowledge weights if RF not provided
+            # Based on solar flare prediction literature
+            rf_weights = torch.tensor([
+                1.0,   # bz_mean - moderate importance
+                1.5,   # bz_std - high importance (variability)
+                1.2,   # bz_max - high importance (peak field)
+                2.0,   # polarity_balance - CRITICAL (PIL indicator)
+                0.8,   # u_mean - moderate (flow)
+                1.0,   # u_max - moderate (peak flow)
+                1.8,   # flux_transport - high (PIL activity)
+                1.5,   # temporal_var - high (field evolution)
+                0.7,   # az_std - lower (indirect)
+            ], dtype=torch.float32)
+            # Normalize to sum to n_features for scale preservation
+            rf_weights = rf_weights / rf_weights.sum() * 9.0
+        
+        # Classifier head with optional RF guidance
+        use_attention = getattr(cfg.classifier, 'use_attention', True)
+        use_physics_features = getattr(cfg.classifier, 'use_physics_features', True)
+        
         self.classifier = ClassifierHead(
             hidden=cfg.classifier.hidden,
             dropout=cfg.classifier.dropout,
-            horizons=cfg.classifier.horizons
+            horizons=cfg.classifier.horizons,
+            use_attention=use_attention,
+            use_physics_features=use_physics_features,
+            rf_importance_weights=rf_weights
         )
         
         # Physics module (same as pure PINN)
@@ -90,9 +121,34 @@ class HybridPINNModel(nn.Module):
         
         # Training state
         self.register_buffer("_train_frac", torch.tensor(0.0))
-        
-        # Cache for (L, g) per window
-        self._latent_cache = {}
+    
+    def _load_rf_weights(self, path: Path) -> Optional[torch.Tensor]:
+        """Load RF importance weights from pickle file."""
+        try:
+            from .rf_guidance import RFImportances
+            rf_imp = RFImportances.load(path)
+            
+            # Map to the 9 physics features used in ClassifierHead
+            feature_mapping = [
+                'bz_mean', 'bz_std', 'bz_max', 'polarity_balance',
+                'mean_gradient', 'max_gradient', 'gwpil',  # Proxies for u_mean, u_max, flux_transport
+                'temporal_variation', 'spatial_entropy'  # Proxies for temporal_var, az_std
+            ]
+            
+            weights = []
+            for name in feature_mapping:
+                w = rf_imp.get_weight(name)
+                weights.append(w)
+            
+            weights = torch.tensor(weights, dtype=torch.float32)
+            # Normalize to preserve feature scale
+            weights = weights / weights.sum() * len(weights)
+            
+            return weights
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to load RF weights from {path}: {e}. Using uniform weights.")
+            return None
     
     def set_train_frac(self, frac: float) -> None:
         frac = float(max(0.0, min(1.0, frac)))
@@ -133,6 +189,14 @@ class HybridPINNModel(nn.Module):
             g: [1, D] - Global code
         """
         # Only encode observed frames (no future leakage!)
+        # frames shape is [T, H, W]
+        
+        if getattr(self.backbone, 'use_temporal_encoder', False):
+            # TemporalEncoder handles raw frames and masking internally
+            # It expects [T, H, W] and [T] mask
+            return self.backbone.encode(frames, observed_mask)
+        
+        # Fallback for TinyEncoder: manually aggregate frames
         obs_frames = frames[observed_mask]  # [T_obs, H, W]
         
         if obs_frames.shape[0] == 0:
@@ -201,10 +265,12 @@ class HybridPINNModel(nn.Module):
         u_y = out["u_y"]
         eta_raw = out["eta_raw"]
         
-        # Optional: compute in-plane field
+        # Optional: compute in-plane field (requires gradients)
         B_x, B_y = None, None
-        if self.cfg.loss_weights.curl_consistency > 0 or mode == "eval":
-            B_x, B_y = B_perp_from_Az(A_z, coords_flat)
+        if self.cfg.loss_weights.curl_consistency > 0:
+            # Only compute if we need it for loss AND have gradients
+            if A_z.requires_grad and coords_flat.requires_grad:
+                B_x, B_y = B_perp_from_Az(A_z, coords_flat)
         
         # Reshape for classifier
         feats_dict = {
@@ -226,14 +292,39 @@ class HybridPINNModel(nn.Module):
         # 1. Classification
         loss_cls = torch.tensor(0.0, device=device)
         if mode == "train" and labels is not None:
-            if self.cfg.classifier.loss_type == "focal":
-                loss_cls = focal_loss(
-                    probs, labels,
-                    alpha=self.cfg.classifier.focal_alpha,
-                    gamma=self.cfg.classifier.focal_gamma
+            label_smoothing = getattr(self.cfg.classifier, 'label_smoothing', 0.0)
+            loss_type = self.cfg.classifier.loss_type
+            
+            if loss_type == "asymmetric":
+                # Asymmetric focal loss - particularly good for imbalanced data
+                gamma_neg = getattr(self.cfg.classifier, 'asymmetric_gamma_neg', 4.0)
+                loss_cls = asymmetric_focal_loss(
+                    logits, labels,
+                    gamma_pos=0.0,  # No focusing on positives
+                    gamma_neg=gamma_neg,
+                    clip=0.05
                 )
-            else:
+            elif loss_type == "focal":
+                if label_smoothing > 0:
+                    loss_cls = focal_loss_with_label_smoothing(
+                        logits, labels,
+                        alpha=self.cfg.classifier.focal_alpha,
+                        gamma=self.cfg.classifier.focal_gamma,
+                        smoothing=label_smoothing
+                    )
+                else:
+                    loss_cls = focal_loss(
+                        logits, labels,  # Pass logits, not probs!
+                        alpha=self.cfg.classifier.focal_alpha,
+                        gamma=self.cfg.classifier.focal_gamma
+                    )
+            else:  # bce
                 loss_cls = bce_logits(logits, labels, pos_weight=self.cfg.classifier.pos_weight)
+            
+            # Add confidence penalty for calibration (if enabled)
+            conf_penalty_weight = getattr(self.cfg.classifier, 'confidence_penalty', 0.0)
+            if conf_penalty_weight > 0:
+                loss_cls = loss_cls + confidence_penalty(probs, conf_penalty_weight)
         
         # 2. Data fitting
         loss_data = torch.tensor(0.0, device=device)
@@ -274,7 +365,10 @@ class HybridPINNModel(nn.Module):
                 p_uniform = torch.full((N, 1), 0.125, device=device)
                 imp_weights, _ = clip_and_renorm_importance(p_uniform, self.cfg.collocation.impw_clip_quantile)
             
-            ess_val = float((imp_weights.sum() ** 2) / (imp_weights ** 2).sum().item())
+            # ESS = (sum(w))^2 / sum(w^2) - measure of effective sample size
+            w_sum = imp_weights.sum()
+            w_sq_sum = (imp_weights ** 2).sum()
+            ess_val = float((w_sum ** 2 / w_sq_sum).item()) if w_sq_sum > 0 else 0.0
             
             # Compute physics residual
             # Soft-bilinear sampler supports 2nd-order gradients

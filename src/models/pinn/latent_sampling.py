@@ -44,19 +44,20 @@ def sample_latent_nearest(L: torch.Tensor, xy_norm: torch.Tensor) -> torch.Tenso
         sampled: [N,P,C] - Sampled latent features at each point
     """
     N, C, H, W = _safe_shape(L, xy_norm)
+    P = xy_norm.size(1)
     x, y = _to_pix_coords(xy_norm, H, W)                         # [N,P]
     xi = x.round().long().clamp(0, W-1)                          # [N,P]
     yi = y.round().long().clamp(0, H-1)                          # [N,P]
 
-    # Gather per batch using scatter/bmm trick
-    idx = yi * W + xi                                            # [N,P]
-    L_flat = L.view(N, C, H*W)                                   # [N,C,HW]
-    # Create one-hot encoding for gathering
-    one_hot = torch.zeros(N, xy_norm.size(1), H*W, device=L.device, dtype=L.dtype)
-    one_hot.scatter_(2, idx.unsqueeze(-1), 1)                    # [N,P,HW]
-    # Matrix multiply: (N,P,HW) x (N,HW,C) -> (N,P,C)
-    out = torch.bmm(one_hot, L_flat.transpose(1,2))
-    return out                                                   # [N,P,C]
+    # Use advanced indexing instead of one-hot (much more memory efficient)
+    # Create batch indices for gathering
+    batch_idx = torch.arange(N, device=L.device)[:, None].expand(N, P)  # [N,P]
+    
+    # L is [N,C,H,W], we want L[n, :, yi[n,p], xi[n,p]] for each (n,p)
+    # Reshape L to [N,C,H,W] and gather using advanced indexing
+    out = L[batch_idx, :, yi, xi]  # [N,P,C]
+    
+    return out
 
 def sample_latent_soft_bilinear(L: torch.Tensor, xy_norm: torch.Tensor) -> torch.Tensor:
     """
@@ -80,6 +81,7 @@ def sample_latent_soft_bilinear(L: torch.Tensor, xy_norm: torch.Tensor) -> torch
         (enables physics loss with second-order derivatives).
     """
     N, C, H, W = _safe_shape(L, xy_norm)
+    P = xy_norm.size(1)
     x, y = _to_pix_coords(xy_norm, H, W)                         # [N,P]
     x0 = torch.floor(x).long().clamp(0, W-2); x1 = x0 + 1
     y0 = torch.floor(y).long().clamp(0, H-2); y1 = y0 + 1
@@ -94,19 +96,14 @@ def sample_latent_soft_bilinear(L: torch.Tensor, xy_norm: torch.Tensor) -> torch
     w10 = fx * (1 - fy)
     w11 = fx * fy                                                # all [N,P]
 
-    def gather_xy(xx, yy):
-        """Gather values at specific pixel coordinates."""
-        idx = yy * W + xx                                        # [N,P]
-        L_flat = L.view(N, C, H*W)                               # [N,C,HW]
-        one_hot = torch.zeros(N, xy_norm.size(1), H*W, device=L.device, dtype=L.dtype)
-        one_hot.scatter_(2, idx.unsqueeze(-1), 1)                # [N,P,HW]
-        return torch.bmm(one_hot, L_flat.transpose(1,2))         # [N,P,C]
-
-    # Gather at 4 corners
-    v00 = gather_xy(x0, y0)
-    v01 = gather_xy(x0, y1)
-    v10 = gather_xy(x1, y0)
-    v11 = gather_xy(x1, y1)                                      # all [N,P,C]
+    # Use advanced indexing (much more memory efficient than one-hot)
+    batch_idx = torch.arange(N, device=L.device)[:, None].expand(N, P)  # [N,P]
+    
+    # Gather at 4 corners using advanced indexing
+    v00 = L[batch_idx, :, y0, x0]  # [N,P,C]
+    v01 = L[batch_idx, :, y1, x0]  # [N,P,C]
+    v10 = L[batch_idx, :, y0, x1]  # [N,P,C]
+    v11 = L[batch_idx, :, y1, x1]  # [N,P,C]
 
     # Weighted sum
     out = (w00.unsqueeze(-1) * v00 + w01.unsqueeze(-1) * v01 +

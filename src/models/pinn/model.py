@@ -170,9 +170,11 @@ class PINNModel(nn.Module):
         eta_raw = out["eta_raw"]
         
         # Optionally compute in-plane field from vector potential
+        # Optional: compute in-plane field (requires gradients)
         B_x, B_y = None, None
-        if self.cfg.loss_weights.curl_consistency > 0 or mode == "eval":
-            B_x, B_y = B_perp_from_Az(A_z, coords_flat)
+        if self.cfg.loss_weights.curl_consistency > 0:
+            if A_z.requires_grad and coords_flat.requires_grad:
+                B_x, B_y = B_perp_from_Az(A_z, coords_flat)
         
         # Reshape for classifier: flatten -> [B, T, P, 1]
         feats_dict = {
@@ -196,7 +198,7 @@ class PINNModel(nn.Module):
         if mode == "train" and labels is not None:
             if self.cfg.classifier.loss_type == "focal":
                 loss_cls = focal_loss(
-                    probs, labels,
+                    logits, labels,  # Pass logits, not probs!
                     alpha=self.cfg.classifier.focal_alpha,
                     gamma=self.cfg.classifier.focal_gamma
                 )

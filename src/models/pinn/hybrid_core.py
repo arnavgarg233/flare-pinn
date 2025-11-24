@@ -9,7 +9,7 @@ import torch.nn as nn
 from typing import Optional
 
 from .core import FourierFeatures, fourier_out_dim, ClassifierHead
-from .encoder import TinyEncoder
+from .encoder import TinyEncoder, TemporalEncoder
 from .latent_sampling import sample_latent_soft_bilinear, sample_latent_nearest
 from .film import FiLM
 
@@ -19,7 +19,7 @@ class HybridPINNBackbone(nn.Module):
     Coordinate MLP conditioned by CNN features.
     
     Architecture:
-        1. Encode observed frames → (L, g) via TinyEncoder
+        1. Encode observed frames → (L, g) via TemporalEncoder (or TinyEncoder)
         2. For each collocation point (x,y,t):
            - Compute Fourier features
            - Sample L at (x,y)
@@ -41,24 +41,40 @@ class HybridPINNBackbone(nn.Module):
         max_log2_freq: int = 5,
         film_layers: tuple[int, ...] = (3, 6, 9),
         learn_eta: bool = False,
-        encoder_dropout: float = 0.05
+        encoder_dropout: float = 0.05,
+        use_temporal_encoder: bool = True
     ):
         super().__init__()
         
-        # CNN encoder
-        self.encoder = TinyEncoder(
-            in_channels=encoder_in_channels,
-            latent_channels=latent_channels,
-            global_dim=global_dim,
-            dropout=encoder_dropout
-        )
+        self.use_temporal_encoder = use_temporal_encoder
+        
+        if use_temporal_encoder:
+            # Advanced temporal encoder
+            self.encoder = TemporalEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                dropout=encoder_dropout
+            )
+            # TemporalEncoder returns concatenated [weighted_L, last_L] -> 2 * latent_channels
+            self.effective_latent_channels = latent_channels * 2
+        else:
+            # Simple frame-averaged encoder
+            self.encoder = TinyEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                dropout=encoder_dropout,
+                use_checkpoint=True
+            )
+            self.effective_latent_channels = latent_channels
         
         # Fourier features
         self.ff = FourierFeatures(3, max_log2_freq)
         ff_dim = fourier_out_dim(3, max_log2_freq)
         
         # Input: [x, y, t, FF, L_sampled, g]
-        in_dim = 3 + ff_dim + latent_channels + global_dim
+        in_dim = 3 + ff_dim + self.effective_latent_channels + global_dim
         out_dim = 5 if learn_eta else 4
         
         # Coordinate MLP with FiLM conditioning
@@ -88,18 +104,29 @@ class HybridPINNBackbone(nn.Module):
         """Annealing for Fourier features."""
         self.ff.set_alpha(a)
     
-    def encode(self, frames_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self, 
+        frames: torch.Tensor, 
+        observed_mask: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Encode observed frames into latent features.
         
         Args:
-            frames_obs: [N, C_in, H, W] - Observed Bz frames (t <= t0 only!)
+            frames: [T, H, W] or [1, 1, H, W] depending on encoder
+            observed_mask: [T] boolean mask (required for TemporalEncoder)
         
         Returns:
             L: [N, C_latent, H, W]
             g: [N, D_global]
         """
-        return self.encoder(frames_obs)
+        if self.use_temporal_encoder:
+            if observed_mask is None:
+                raise ValueError("observed_mask required for TemporalEncoder")
+            L, g, _ = self.encoder(frames, observed_mask)
+            return L, g
+        else:
+            return self.encoder(frames)
     
     def forward(
         self,

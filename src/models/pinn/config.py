@@ -37,10 +37,26 @@ class ClassifierConfig(BaseModel):
     hidden: int = Field(default=256, ge=64, le=1024)
     dropout: float = Field(default=0.1, ge=0.0, le=0.9)
     horizons: tuple[int, ...] = Field(default=(6, 12, 24), description="Prediction horizons in hours")
-    loss_type: Literal["bce", "focal"] = Field(default="focal")
+    loss_type: Literal["bce", "focal", "asymmetric"] = Field(default="focal")
     focal_alpha: float = Field(default=0.25, ge=0.0, le=1.0, description="Focal loss alpha (weight for positive class)")
     focal_gamma: float = Field(default=2.0, ge=0.0, le=5.0, description="Focal loss gamma (focusing parameter)")
+    asymmetric_gamma_neg: float = Field(default=4.0, ge=0.0, le=8.0, description="Asymmetric focal loss gamma for negatives")
     pos_weight: Optional[float] = Field(default=None, ge=1.0, description="Positive class weight for BCE")
+    use_rf_guidance: bool = Field(default=False, description="Use Random Forest feature importance weighting")
+    rf_weights_path: Optional[Path] = Field(default=None, description="Path to pre-computed RF importance weights pickle")
+    use_attention: bool = Field(default=True, description="Use spatial and temporal attention in classifier")
+    use_physics_features: bool = Field(default=True, description="Use physics-derived features in classifier")
+    label_smoothing: float = Field(default=0.0, ge=0.0, le=0.2, description="Label smoothing factor for focal loss")
+    confidence_penalty: float = Field(default=0.0, ge=0.0, le=1.0, description="Weight for confidence/entropy regularization")
+    gradient_penalty: float = Field(default=0.0, ge=0.0, le=1.0, description="Weight for gradient penalty (Lipschitz regularization)")
+    mixup_alpha: float = Field(default=0.0, ge=0.0, le=1.0, description="Mixup augmentation alpha (0 = disabled)")
+    
+    @field_validator('rf_weights_path', mode='before')
+    @classmethod
+    def validate_rf_path(cls, v):
+        if v is not None:
+            return Path(v)
+        return v
 
 
 class PhysicsConfig(BaseModel):
@@ -100,6 +116,20 @@ class CollocationConfig(BaseModel):
         return self
 
 
+class SchedulerConfig(BaseModel):
+    """Learning rate scheduler configuration."""
+    type: Literal["cosine", "step", "constant"] = Field(default="cosine")
+    warmup_steps: int = Field(default=1000, ge=0, le=50000)
+    min_lr: float = Field(default=1e-6, ge=0.0, le=1e-2)
+
+
+class SamplerConfig(BaseModel):
+    """Data sampling configuration for class imbalance."""
+    strategy: Literal["random", "class_balanced", "sqrt_balanced"] = Field(default="class_balanced")
+    positive_multiplier: float = Field(default=10.0, ge=1.0, le=200.0, description="Oversampling multiplier for positive class (up to 200x for severe imbalance)")
+    smoothing: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
 class TrainConfig(BaseModel):
     """Training hyperparameters."""
     steps: int = Field(default=50000, ge=100, le=1000000)
@@ -111,6 +141,10 @@ class TrainConfig(BaseModel):
     eval_every: int = Field(default=500, ge=10)
     checkpoint_every: int = Field(default=5000, ge=100)
     checkpoint_dir: Optional[Path] = Field(default=None, description="Directory for checkpoints")
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    sampler: SamplerConfig = Field(default_factory=SamplerConfig)
+    use_ema: bool = Field(default=True, description="Use Exponential Moving Average for model weights")
+    ema_decay: float = Field(default=0.999, ge=0.9, le=0.9999, description="EMA decay rate")
     
     @field_validator('checkpoint_dir', mode='before')
     @classmethod
@@ -130,6 +164,8 @@ class DataConfig(BaseModel):
     input_hours: int = Field(default=48, ge=6, le=120, description="Input time window (hours)")
     P_per_t: int = Field(default=1024, ge=256, le=8192, description="Points sampled per time slice")
     pil_top_pct: float = Field(default=0.15, ge=0.01, le=0.5, description="Top % of |∇Bz| for PIL mask")
+    val_fraction: float = Field(default=0.15, ge=0.05, le=0.3, description="Validation set fraction")
+    scalar_features: list[str] = Field(default_factory=list, description="Additional scalar features to use")
     
     # Dummy data settings
     dummy_T: int = Field(default=8, ge=2, le=48, description="Dummy time steps")

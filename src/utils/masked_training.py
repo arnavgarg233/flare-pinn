@@ -142,7 +142,7 @@ def compute_masked_metrics(predictions: torch.Tensor, targets: torch.Tensor, mas
     """
     import sklearn.metrics as metrics
     
-    if logits.dim() == 2:
+    if predictions.dim() == 2:
         predictions = predictions.squeeze(1)
     
     # Apply mask

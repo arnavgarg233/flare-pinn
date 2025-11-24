@@ -576,12 +576,12 @@ def main():
         train_ds = WindowsDataset(train_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root), 
                                   target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
                                   horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t, 
-                                  pil_top_pct=cfg.data.pil_top_pct, scalar_features=cfg.data.scalar_features)
+                                  pil_top_pct=cfg.data.pil_top_pct)
         
         val_ds = WindowsDataset(val_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root),
                                 target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
                                 horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t,
-                                pil_top_pct=cfg.data.pil_top_pct, scalar_features=cfg.data.scalar_features)
+                                pil_top_pct=cfg.data.pil_top_pct)
         
         # Sampler
         horizon_cols = [f"y_geq_M_{h}h" for h in cfg.classifier.horizons]

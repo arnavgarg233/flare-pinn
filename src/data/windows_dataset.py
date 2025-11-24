@@ -140,7 +140,7 @@ class WindowsDataset(Dataset):
                 nan_mask = ~np.isfinite(bz)
                 bz[nan_mask] = 0.0
             
-            # Normalization: robust clipping + optional z-score
+            # Normalization: robust clipping + global scaling
             # SHARP Bz typical range: [-3000, +3000] Gauss
             # We clip outliers then normalize to reasonable range for neural network
             valid_values = bz[np.abs(bz) > 1e-10]  # Exclude near-zero values
@@ -151,14 +151,14 @@ class WindowsDataset(Dataset):
                 # Not enough valid data - just clip to reasonable range
                 bz = np.clip(bz, -3000.0, 3000.0)
             
-            # Scale to approximately [-1, 1] range for better gradient flow
-            # Typical AR has std ~ 500-1000 G after clipping
-            bz_std = np.std(bz)
-            if bz_std < 1e-6:
-                # Constant or near-constant field - use fallback scaling
-                bz_std = max(np.abs(bz).max(), 1000.0)
-            bz = bz / (3.0 * bz_std)  # 3-sigma scaling
-            bz = np.clip(bz, -3.0, 3.0)  # Final safety clip
+            # FIXED: Use GLOBAL normalization instead of per-frame
+            # Per-frame normalization destroys relative magnitude information (flux emergence)
+            # We scale 3000 Gauss to 1.0, which is a standard dynamic range for active regions
+            GLOBAL_SCALE = 3000.0
+            bz = bz / GLOBAL_SCALE
+            
+            # Final safety clip to [-1, 1] (handles extreme outliers > 3000G)
+            bz = np.clip(bz, -1.0, 1.0)
             
             # Final check for NaN/Inf after normalization
             if not np.isfinite(bz).all():
