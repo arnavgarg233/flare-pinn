@@ -53,32 +53,65 @@ def mix_pil_uniform(
 def clip_and_renorm_importance(
     p: torch.Tensor, 
     clip_quantile: float = 0.99,
-    max_weight_ratio: float = 100.0  # Hard cap on max/min ratio
+    max_weight_ratio: float = 100.0,  # Hard cap on max/min ratio
+    min_ess_fraction: float = 0.1,  # Minimum ESS as fraction of N
 ) -> tuple[torch.Tensor, float]:
     """
-    Clip and renormalize importance weights to prevent extreme values.
+    Clip and renormalize importance weights to emphasize high-probability regions.
+    
+    FIXED: Previously computed 1/p which INVERTED the weighting, emphasizing
+    quiet-sun regions instead of PIL. Now uses p directly so that PIL regions
+    (high p) get higher weights in the physics loss.
+    
+    IMPROVED: Added ESS monitoring to prevent weights from becoming too extreme.
+    If ESS drops below threshold, automatically increases clipping.
     
     Args:
-        p: [N, 1] probability values
+        p: [N, 1] probability/importance values (higher = more important)
         clip_quantile: Quantile for soft clipping
         max_weight_ratio: Hard cap on max/min weight ratio
+        min_ess_fraction: Minimum ESS as fraction of N (0.1 = at least 10% effective samples)
+        
+    Returns:
+        w_tilde: [N, 1] normalized importance weights (mean = 1)
+        threshold: float, the clipping threshold used
     """
-    inv = 1.0 / p.clamp_min(1e-12)
+    N = p.shape[0]
+    min_ess = max(10, int(N * min_ess_fraction))  # At least 10 effective samples
+    
+    # Use p directly (NOT 1/p) so high-probability regions get higher weights
+    w = p.clone()
     
     with torch.no_grad():
-        # Soft clip by quantile
-        thr = torch.quantile(inv, float(clip_quantile))
+        # Iteratively adjust clipping until ESS is acceptable
+        current_quantile = clip_quantile
+        max_attempts = 5
         
-        # Hard clip to prevent extreme ratios
-        # max_weight_ratio limits how much more important any point can be
-        min_inv = inv.min()
-        hard_thr = min_inv * max_weight_ratio
-        thr = min(thr, hard_thr)
-    
-    w = torch.minimum(inv, thr)
-    
-    # Renormalize so mean = 1
-    w_tilde = w / w.mean().clamp_min(1e-12)
+        for attempt in range(max_attempts):
+            # Soft clip by quantile to prevent extreme values
+            thr = torch.quantile(w, float(current_quantile))
+            
+            # Hard clip to prevent extreme ratios
+            min_w = w.min().clamp(min=1e-12)
+            hard_thr = min_w * max_weight_ratio
+            thr = min(thr, hard_thr)
+            
+            w_clipped = torch.minimum(w, thr)
+            
+            # Renormalize so mean = 1
+            w_tilde = w_clipped / w_clipped.mean().clamp_min(1e-12)
+            
+            # Compute ESS
+            w_normalized = w_tilde / w_tilde.sum()
+            current_ess = 1.0 / (w_normalized ** 2).sum()
+            
+            if current_ess >= min_ess:
+                break
+            
+            # ESS too low - increase clipping (reduce variance)
+            # Lower quantile = more aggressive clipping
+            current_quantile = max(0.5, current_quantile - 0.1)
+            max_weight_ratio = max(10.0, max_weight_ratio * 0.5)
     
     return w_tilde, float(thr.item())
 

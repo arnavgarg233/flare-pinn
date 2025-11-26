@@ -1,0 +1,120 @@
+# sota_optimized.yaml
+# SOTA-optimized configuration for solar flare prediction
+# Target: TSS > 0.80, PR-AUC > 0.50
+#
+# Key improvements over baseline:
+# 1. Class-balanced focal loss for 1:50 imbalance
+# 2. Uncertainty-weighted physics loss balancing
+# 3. Force-free field constraint
+# 4. 18 physics features (up from 13)
+# 5. Transformer temporal encoder option
+# 6. Temporal acceleration features
+
+seed: 42
+device: "cuda"  # or "mps" for Apple Silicon
+
+model:
+  model_type: "hybrid"
+  hidden: 512  # Increased capacity
+  layers: 12   # Deeper network
+  learn_eta: false
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 6  # Higher frequency resolution
+    ramp_frac: 0.4    # Faster frequency ramp
+  vector_B: true  # Enable full vector physics
+  encoder:
+    type: "temporal"  # Options: tiny, temporal, transformer, multiscale
+    latent_channels: 48
+    global_dim: 96
+    n_transformer_layers: 3
+    n_heads: 4
+    dropout: 0.1
+
+classifier:
+  hidden: 384  # Larger classifier
+  dropout: 0.15
+  horizons: [6, 12, 24]
+  loss_type: "cb_focal"  # Class-balanced focal loss
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  cb_beta: 0.9999  # High beta for extreme imbalance
+  poly_epsilon: 1.0
+  use_attention: true
+  use_physics_features: true  # Uses 18 physics features now
+  use_rf_guidance: true  # Domain-knowledge weighting
+  label_smoothing: 0.02  # Light smoothing for calibration
+  confidence_penalty: 0.05  # Prevent overconfidence
+  mixup_alpha: 0.2  # Data augmentation
+
+physics:
+  enable: true
+  resistive: true  # Include diffusion terms
+  boundary_terms: false
+  lambda_phys_schedule:
+    - [0.0, 0.0]   # Start with pure data fitting
+    - [0.2, 0.0]   # 20% pure data
+    - [0.4, 1.0]   # Gradual physics ramp
+    - [0.7, 3.0]   # Full physics
+    - [1.0, 4.0]   # Slight increase at end
+  div_B_weight: 1.5  # Stronger solenoidal constraint
+  component_weights: [1.0, 1.0, 1.2]  # Slight Bz emphasis (more reliable)
+  use_uncertainty_weighting: true  # Automatic loss balancing
+  enforce_force_free: true  # Add J × B ≈ 0 constraint
+  force_free_weight: 0.1
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 0.001
+
+loss_weights:
+  cls: 1.0
+  data: 0.5  # Reduced for physics emphasis
+  curl_consistency: 0.1
+
+collocation:
+  n_max: 25000  # More collocation points
+  alpha_start: 0.6  # Start with PIL emphasis
+  alpha_end: 0.85   # Strong PIL focus
+  impw_clip_quantile: 0.98
+
+train:
+  steps: 100000  # Longer training
+  batch_size: 4  # Larger batches for stability
+  num_workers: 4
+  lr: 5.0e-4  # Lower LR for stability
+  grad_clip: 1.0
+  amp: true
+  log_every: 50
+  eval_every: 1000
+  checkpoint_every: 5000
+  checkpoint_dir: "outputs/checkpoints/sota_optimized"
+  scheduler:
+    type: "cosine"
+    warmup_steps: 2000
+    min_lr: 1.0e-6
+  sampler:
+    strategy: "class_balanced"
+    positive_multiplier: 20.0  # Strong oversampling
+    smoothing: 0.3
+  use_ema: true
+  ema_decay: 0.9995
+
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: "~/flare_data/consolidated"
+  windows_parquet: "data/interim/windows_train.parquet"
+  target_size: 128
+  input_hours: 48
+  P_per_t: 1024
+  pil_top_pct: 0.12  # Tighter PIL threshold
+  val_fraction: 0.15
+  components: ["Bz"]  # Or ["Bx", "By", "Bz"] for full vector
+  scalar_features:
+    - "r_value"
+    - "gwpil"
+    - "obs_coverage"
+    - "frame_count"
+

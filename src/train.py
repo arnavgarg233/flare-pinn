@@ -15,9 +15,10 @@ import argparse
 import logging
 import time
 import warnings
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,14 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 warnings.filterwarnings('ignore', message='.*MPS autocast.*')
 warnings.filterwarnings('ignore', category=UserWarning, module='torch.amp')
 
+# W&B import (optional dependency)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
+
 from src.models.pinn import PINNConfig, PINNModel, HybridPINNModel
 from src.models.eval.metrics import (
     pr_auc,
@@ -38,7 +47,12 @@ from src.models.eval.metrics import (
     sweep_tss,
     select_threshold_at_far,
 )
-from src.utils.training_utils import optimize_for_device
+from src.utils.training_utils import optimize_for_device, clear_memory_cache
+from src.utils.memory_optimization import (
+    MPSGradientAccumulator,
+    aggressive_memory_cleanup,
+    low_memory_mode,
+)
 
 # ============================================================================
 # Dummy Dataset for Testing
@@ -67,7 +81,7 @@ class DummyPINNDataset(Dataset):
         coords[..., :2] = torch.rand(self.T, self.P, 2) * 2.0 - 1.0  # xy in [-1,1]
         t_vals = torch.linspace(-1.0, 1.0, self.T)[:, None, None].expand(self.T, self.P, 1)
         coords[..., 2:3] = t_vals
-        coords.requires_grad_(True)
+        # Don't set requires_grad here - will be set in training loop
         
         # Generate synthetic Bz field (dipole-like pattern)
         x_grid = torch.linspace(-1, 1, self.W)
@@ -100,14 +114,23 @@ class DummyPINNDataset(Dataset):
         # Random labels (with ~20% positive rate for imbalance)
         labels = (torch.rand(len(self.horizons)) < 0.2).float()
         
-        # PIL mask (high gradient regions)
+        # PIL mask (high gradient regions) - as tensor for type consistency
         grad_x = torch.abs(frames[-1, :, 1:] - frames[-1, :, :-1])  # [H, W-1]
         grad_y = torch.abs(frames[-1, 1:, :] - frames[-1, :-1, :])  # [H-1, W]
         # Pad to match size [H, W] using simple concatenation
         grad_x = torch.cat([grad_x, grad_x[:, -1:]], dim=1)  # [H, W]
         grad_y = torch.cat([grad_y, grad_y[-1:, :]], dim=0)  # [H, W]
         grad_mag = torch.sqrt(grad_x**2 + grad_y**2)
-        pil_mask = (grad_mag > grad_mag.quantile(0.85)).numpy().astype(np.uint8)
+        pil_mask = (grad_mag > grad_mag.quantile(0.85)).float()  # Keep as tensor
+        
+        # Scalar features (dummy values for testing)
+        # [r_value, gwpil, obs_coverage, frame_count]
+        scalars = torch.tensor([
+            2.5,   # Dummy R-value (typical range: 1-5)
+            100.0, # Dummy GWPIL
+            1.0,   # All frames observed
+            float(self.T),  # Frame count
+        ], dtype=torch.float32)
         
         return {
             "coords": coords,
@@ -116,6 +139,7 @@ class DummyPINNDataset(Dataset):
             "observed_mask": observed_mask,
             "labels": labels,
             "pil_mask": pil_mask,
+            "scalars": scalars,
         }
 
 # ============================================================================
@@ -125,6 +149,11 @@ class DummyPINNDataset(Dataset):
 def setup_logging(log_path: Optional[Path] = None) -> logging.Logger:
     logger = logging.getLogger("pinn_train")
     logger.setLevel(logging.INFO)
+    
+    # FIXED: Clear existing handlers to prevent duplicate logging
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
     formatter = logging.Formatter(
         fmt='%(asctime)s | %(levelname)-8s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
@@ -246,19 +275,37 @@ class MetricsBuffer:
 # ============================================================================
 
 class PINNTrainer:
-    def __init__(self, cfg: PINNConfig, logger: logging.Logger):
+    def __init__(self, cfg: PINNConfig, logger: logging.Logger, use_wandb: bool = False):
         self.cfg = cfg
         self.logger = logger
         self.device = self._get_device(cfg.device)
         optimize_for_device(self.device)
         
+        # W&B initialization
+        self.use_wandb = use_wandb and WANDB_AVAILABLE and not os.getenv("WANDB_DISABLED")
+        if self.use_wandb and wandb.run is None:
+            # Only init if not already initialized by sweep
+            wandb.init(
+                project=os.getenv("WANDB_PROJECT", "flare-pinn-sota"),
+                config=cfg.model_dump(),
+                name=f"{cfg.model.model_type}_lr{cfg.train.lr}"
+            )
+        
         # Model
         if cfg.model.model_type == "hybrid":
-            self.model = HybridPINNModel(cfg, encoder_in_channels=1).to(self.device)
+            self.model = HybridPINNModel(cfg, encoder_in_channels=None).to(self.device)
         else:
             self.model = PINNModel(cfg).to(self.device)
-            
-        self.logger.info(f"Model Params: {sum(p.numel() for p in self.model.parameters()):,}")
+        
+        n_params = sum(p.numel() for p in self.model.parameters())
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"Model Params: {n_params:,} ({n_trainable:,} trainable)")
+        
+        # Memory estimation for MPS
+        if self.device.type == "mps":
+            param_memory_mb = n_params * 4 / 1e6  # float32
+            self.logger.info(f"Estimated model memory: {param_memory_mb:.1f} MB")
+            self.logger.info("⚠️  MPS mode: Using gradient accumulation for larger effective batch")
         
         # Optimizer & Scheduler with weight decay
         self.optimizer = optim.AdamW(
@@ -267,8 +314,27 @@ class PINNTrainer:
             weight_decay=0.01,  # L2 regularization
             betas=(0.9, 0.999)
         )
-        self.use_amp = cfg.train.amp and self.device.type == "cuda"
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        
+        # AMP setup - MPS uses different approach
+        self.use_amp = cfg.train.amp
+        if self.device.type == "cuda":
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        else:
+            self.scaler = None  # MPS doesn't use GradScaler
+        
+        # Gradient accumulation for effective larger batches
+        accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 1)
+        if accum_steps > 1:
+            self.grad_accumulator = MPSGradientAccumulator(
+                self.model,
+                self.optimizer,
+                accum_steps=accum_steps,
+                grad_clip=cfg.train.grad_clip,
+                cleanup_every=getattr(cfg.train, 'memory_cleanup_every', 50)
+            )
+            self.logger.info(f"Gradient accumulation: {accum_steps} steps (effective batch = {cfg.train.batch_size * accum_steps})")
+        else:
+            self.grad_accumulator = None
         
         # Scheduler
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -282,9 +348,9 @@ class PINNTrainer:
             self.ema = ExponentialMovingAverage(self.model, decay=cfg.train.ema_decay)
             self.logger.info(f"EMA enabled with decay={cfg.train.ema_decay}")
         
-        # Early stopping
+        # Early stopping - FIXED: Higher patience for physics-heavy training
         from src.utils.training_utils import EarlyStopping
-        self.early_stopping = EarlyStopping(patience=10, min_delta=0.001, mode='max')
+        self.early_stopping = EarlyStopping(patience=25, min_delta=0.005, mode='max')
         
         self.checkpoint_mgr = None
         if cfg.train.checkpoint_dir:
@@ -293,6 +359,13 @@ class PINNTrainer:
         self.metrics_buffer = MetricsBuffer()
         self.step = 0
         self.best_val_tss = 0.0
+        
+        # MPS-specific settings
+        self.memory_cleanup_every = getattr(cfg.train, 'memory_cleanup_every', 50)
+        self._accumulated_loss = 0.0
+        self._accumulated_phys = 0.0
+        self._accumulated_cls = 0.0
+        self._accumulated_count = 0
 
     def _get_device(self, requested: str) -> torch.device:
         if requested == "mps" and torch.backends.mps.is_available(): return torch.device("mps")
@@ -305,20 +378,32 @@ class PINNTrainer:
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=True)
         
+        # Enable gradients for coords (needed for physics loss)
+        batch["coords"].requires_grad_(True)
+        
         # Update curriculum
         frac = min(1.0, self.step / self.cfg.train.steps)
         self.model.set_train_frac(frac)
         
-        self.optimizer.zero_grad(set_to_none=True)
+        # Clear gradients if not using accumulator
+        if self.grad_accumulator is None:
+            self.optimizer.zero_grad(set_to_none=True)
         
         # Forward
         autocast_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        use_autocast = self.use_amp or (self.device.type == "mps" and self.cfg.train.amp)
+        # MPS autocast with bfloat16 is more stable (if available)
+        if self.device.type == "mps":
+            autocast_dtype = torch.float32  # MPS float16 has issues, use float32
+            use_autocast = False  # Disable autocast on MPS for stability
+        else:
+            use_autocast = self.use_amp
         
         with torch.autocast(self.device.type, dtype=autocast_dtype, enabled=use_autocast):
             # Unpack batch manually to handle list inputs like pil_mask if needed
             B = batch["coords"].shape[0]
             total_loss = 0.0
+            total_phys = 0.0  # Accumulate physics loss across batch
+            total_cls = 0.0   # Accumulate classification loss across batch
             batch_probs, batch_labels = [], []
             
             # Process samples (PINN loop)
@@ -328,16 +413,19 @@ class PINNTrainer:
                     "gt_bz": batch["gt_bz"][i],
                     "observed_mask": batch["observed_mask"][i],
                     "labels": batch["labels"][i:i+1],
-                    "pil_mask": batch["pil_mask"][i].cpu().numpy() if isinstance(batch["pil_mask"], torch.Tensor) else batch["pil_mask"][i],
-                    "mode": "train"
+                    "pil_mask": batch["pil_mask"][i],  # Now always a tensor
+                    "mode": "train",
                 }
                 if "frames" in batch:
                     sample_kwargs["frames"] = batch["frames"][i]
+                # Pass scalar features (R-value, GWPIL, etc.) to model
                 if "scalars" in batch:
                     sample_kwargs["scalars"] = batch["scalars"][i]
                 
                 out = self.model(**sample_kwargs)
                 total_loss += out.loss_total / B
+                total_phys += out.loss_phys.item() / B  # Accumulate physics loss
+                total_cls += out.loss_cls.item() / B    # Accumulate cls loss
                 batch_probs.append(out.probs)
                 batch_labels.append(batch["labels"][i:i+1])
             
@@ -345,47 +433,118 @@ class PINNTrainer:
             probs = torch.cat(batch_probs)
             labels = torch.cat(batch_labels)
 
-        # Backward
-        if self.use_amp:
+        # NaN check - skip update if loss is NaN
+        if torch.isnan(loss) or torch.isinf(loss):
+            self.logger.warning(f"Step {self.step}: NaN/Inf loss detected, skipping update")
+            if self.grad_accumulator:
+                self.grad_accumulator.zero_grad()
+            return {
+                "loss": 0.0, "phys": 0.0, "cls": 0.0, "lam": 0.0
+            }
+
+        # Backward with gradient accumulation support
+        did_step = False
+        grad_norm = 0.0
+        
+        if self.grad_accumulator is not None:
+            # Use gradient accumulator (handles scaling and stepping)
+            did_step = self.grad_accumulator.step(loss, self.step)
+            if did_step:
+                grad_norm = self.cfg.train.grad_clip  # Approximate
+        elif self.scaler is not None:
+            # CUDA with AMP
             self.scaler.scale(loss).backward()
             if self.cfg.train.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.grad_clip)
-            else:
-                grad_norm = 0.0
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            did_step = True
         else:
+            # Standard backward (MPS or CPU)
             loss.backward()
             if self.cfg.train.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.grad_clip)
-            else:
-                grad_norm = 0.0
+            
+            # Check for NaN gradients
+            has_nan_grad = False
+            for p in self.model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    has_nan_grad = True
+                    break
+            
+            if has_nan_grad:
+                self.logger.warning(f"Step {self.step}: NaN/Inf gradients detected, zeroing gradients")
+                self.optimizer.zero_grad(set_to_none=True)
+                return {"loss": 0.0, "phys": 0.0, "cls": 0.0, "lam": 0.0, "grad_norm": 0.0}
+            
             self.optimizer.step()
+            did_step = True
         
-        # Update EMA
-        if self.ema is not None:
+        # Update EMA only when optimizer stepped
+        if did_step and self.ema is not None:
             self.ema.update()
             
-        # Scheduler (warmup manual)
-        if self.step < self.cfg.train.scheduler.warmup_steps:
-            lr_scale = min(1.0, float(self.step + 1) / self.cfg.train.scheduler.warmup_steps)
-            for pg in self.optimizer.param_groups:
-                pg['lr'] = self.cfg.train.lr * lr_scale
-        else:
-            self.scheduler.step()
+        # Scheduler (warmup manual) - only when optimizer stepped
+        if did_step:
+            if self.step < self.cfg.train.scheduler.warmup_steps:
+                lr_scale = min(1.0, float(self.step + 1) / self.cfg.train.scheduler.warmup_steps)
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = self.cfg.train.lr * lr_scale
+            else:
+                self.scheduler.step()
+        
+        # MPS memory cleanup
+        if self.device.type == "mps" and self.step % self.memory_cleanup_every == 0:
+            aggressive_memory_cleanup()
             
         with torch.no_grad():
             self.metrics_buffer.add(probs.detach().cpu().numpy(), labels.detach().cpu().numpy())
-            
-        return {
-            "loss": loss.item(),
-            "phys": out.loss_phys.item(),
-            "cls": out.loss_cls.item(),
+        
+        # Track accumulated stats for logging
+        self._accumulated_loss += loss.item()
+        self._accumulated_phys += total_phys
+        self._accumulated_cls += total_cls
+        self._accumulated_count += 1
+        
+        # Return averaged stats
+        if did_step and self._accumulated_count > 0:
+            avg_loss = self._accumulated_loss / self._accumulated_count
+            avg_phys = self._accumulated_phys / self._accumulated_count
+            avg_cls = self._accumulated_cls / self._accumulated_count
+            self._accumulated_loss = 0.0
+            self._accumulated_phys = 0.0
+            self._accumulated_cls = 0.0
+            self._accumulated_count = 0
+        else:
+            avg_loss = loss.item()
+            avg_phys = total_phys
+            avg_cls = total_cls
+        
+        metrics_dict = {
+            "loss": avg_loss,
+            "phys": avg_phys,
+            "cls": avg_cls,
             "lam": out.lambda_phys,
             "alpha": out.fourier_alpha,
-            "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
+            "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            "did_step": did_step,
         }
+        
+        # Log to W&B
+        if self.use_wandb and self.step % self.cfg.train.log_every == 0:
+            wandb.log({
+                "train/loss_total": metrics_dict["loss"],
+                "train/loss_cls": metrics_dict["cls"],
+                "train/loss_phys": metrics_dict["phys"],
+                "train/grad_norm": metrics_dict["grad_norm"],
+                "physics/lambda": metrics_dict["lam"],
+                "physics/fourier_alpha": metrics_dict["alpha"],
+                "optimizer/lr": self.optimizer.param_groups[0]['lr'],
+                "step": self.step
+            }, step=self.step)
+        
+        return metrics_dict
 
     def evaluate(self, loader: DataLoader, use_ema: bool = True) -> dict:
         """
@@ -407,7 +566,8 @@ class PINNTrainer:
         # Use EMA weights if available (with proper context manager)
         ema_context = self.ema.average_parameters() if (use_ema and self.ema is not None) else None
         
-        with torch.no_grad():
+        # Use low memory mode for MPS
+        with torch.no_grad(), low_memory_mode():
             # Enter EMA context if available
             if ema_context is not None:
                 ema_context.__enter__()
@@ -426,11 +586,12 @@ class PINNTrainer:
                             "gt_bz": batch["gt_bz"][i],
                             "observed_mask": batch["observed_mask"][i],
                             "labels": batch["labels"][i:i+1],
-                            "pil_mask": batch["pil_mask"][i].cpu().numpy() if isinstance(batch["pil_mask"], torch.Tensor) else batch["pil_mask"][i],
-                            "mode": "eval"
+                            "pil_mask": batch["pil_mask"][i],  # Now always a tensor
+                            "mode": "eval",
                         }
                         if "frames" in batch:
                             sample_kwargs["frames"] = batch["frames"][i]
+                        # Pass scalar features (R-value, GWPIL, etc.) to model
                         if "scalars" in batch:
                             sample_kwargs["scalars"] = batch["scalars"][i]
                         
@@ -488,8 +649,12 @@ class PINNTrainer:
         t_start = time.time()
         stopped_early = False
         
+        self.logger.info(f"Starting training loop... (target: {self.cfg.train.steps} steps)")
+        
         while self.step < self.cfg.train.steps and not stopped_early:
             for batch in train_loader:
+                if self.step == 0:
+                    self.logger.info("First batch loaded from disk!")
                 self.step += 1
                 metrics = self.train_step(batch)
                 
@@ -511,8 +676,24 @@ class PINNTrainer:
                         val_results = self.evaluate(val_loader)
                         val_tss = val_results["max_tss"]
                         
+                        # Clear memory after validation to prevent fragmentation/leaks
+                        clear_memory_cache(self.device)
+                        
                         # Log detailed metrics
                         self.logger.info(f"[Val] Max TSS: {val_tss:.4f}")
+                        
+                        # W&B logging
+                        if self.use_wandb:
+                            log_dict = {"val/tss_max": val_tss, "step": self.step}
+                            for h, h_metrics in val_results.get("horizons", {}).items():
+                                log_dict.update({
+                                    f"val/tss_{h}h": h_metrics["tss"],
+                                    f"val/pr_auc_{h}h": h_metrics["pr_auc"],
+                                    f"val/brier_{h}h": h_metrics["brier"],
+                                    f"val/ece_{h}h": h_metrics["ece"],
+                                })
+                            wandb.log(log_dict, step=self.step)
+                        
                         for h, h_metrics in val_results.get("horizons", {}).items():
                             self.logger.info(
                                 f"  {h}h: TSS={h_metrics['tss']:.3f}@{h_metrics['threshold']:.2f} | "
@@ -560,28 +741,83 @@ def main():
     
     # Load Data
     if cfg.data.use_real:
-        from src.data.windows_dataset import WindowsDataset
         from src.utils.masked_training import load_windows_with_mask
         
         logger.info("Loading real data...")
+        logger.info("  Reading windows parquet...")
         df, mask = load_windows_with_mask(str(cfg.data.windows_parquet))
         df = df[mask].reset_index(drop=True)
+        logger.info(f"  Loaded {len(df)} windows")
         
-        # Split
-        val_idx = int(len(df) * (1 - cfg.data.val_fraction))
-        train_df = df.iloc[:val_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx:].reset_index(drop=True)
+        # FIXED: Split by HARP number to prevent temporal leakage
+        # Windows from same HARP should all be in train OR val, not both
+        unique_harps = df['harpnum'].unique()
+        np.random.seed(cfg.seed)  # Reproducible split
+        np.random.shuffle(unique_harps)
+        n_val_harps = max(1, int(len(unique_harps) * cfg.data.val_fraction))
+        val_harps = set(unique_harps[:n_val_harps])
         
-        # Datasets
-        train_ds = WindowsDataset(train_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root), 
-                                  target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
-                                  horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t, 
-                                  pil_top_pct=cfg.data.pil_top_pct)
+        train_df = df[~df['harpnum'].isin(val_harps)].reset_index(drop=True)
+        val_df = df[df['harpnum'].isin(val_harps)].reset_index(drop=True)
         
-        val_ds = WindowsDataset(val_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root),
-                                target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
-                                horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t,
-                                pil_top_pct=cfg.data.pil_top_pct)
+        # Log class balance
+        train_pos = train_df[[f"y_geq_M_{h}h" for h in cfg.classifier.horizons]].sum().sum()
+        val_pos = val_df[[f"y_geq_M_{h}h" for h in cfg.classifier.horizons]].sum().sum()
+        logger.info(f"  Train: {len(train_df)} windows ({len(unique_harps) - n_val_harps} HARPs), {train_pos:.0f} positive labels")
+        logger.info(f"  Val: {len(val_df)} windows ({n_val_harps} HARPs), {val_pos:.0f} positive labels")
+        
+        # Choose dataset based on config
+        if cfg.data.use_consolidated:
+            from src.data.consolidated_dataset import ConsolidatedWindowsDataset
+            logger.info("  Using CONSOLIDATED dataset (fast I/O)...")
+            
+            train_ds = ConsolidatedWindowsDataset(
+                windows_df=train_df,
+                consolidated_dir=str(cfg.data.consolidated_dir),
+                target_px=cfg.data.target_size,
+                input_hours=cfg.data.input_hours,
+                horizons=list(cfg.classifier.horizons),
+                P_per_t=cfg.data.P_per_t,
+                pil_top_pct=cfg.data.pil_top_pct,
+                training=True,
+                augment=True,
+                noise_std=0.02,
+                max_cached_harps=500
+            )
+            
+            val_ds = ConsolidatedWindowsDataset(
+                windows_df=val_df,
+                consolidated_dir=str(cfg.data.consolidated_dir),
+                target_px=cfg.data.target_size,
+                input_hours=cfg.data.input_hours,
+                horizons=list(cfg.classifier.horizons),
+                P_per_t=cfg.data.P_per_t,
+                pil_top_pct=cfg.data.pil_top_pct,
+                training=False,
+                augment=False,
+                max_cached_harps=500
+            )
+        else:
+            from src.data.cached_dataset import CachedWindowsDataset
+            logger.info("  Using CACHED dataset (slower I/O, higher quality)...")
+            
+            train_ds = CachedWindowsDataset(
+                train_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root), 
+                target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
+                horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t, 
+                pil_top_pct=cfg.data.pil_top_pct,
+                training=True, augment=True, noise_std=0.02, preload=False
+            )
+            
+            val_ds = CachedWindowsDataset(
+                val_df, str(cfg.data.frames_meta_parquet), str(cfg.data.npz_root),
+                target_px=cfg.data.target_size, input_hours=cfg.data.input_hours,
+                horizons=list(cfg.classifier.horizons), P_per_t=cfg.data.P_per_t,
+                pil_top_pct=cfg.data.pil_top_pct,
+                training=False, augment=False, preload=False
+            )
+        
+        logger.info("  Datasets created!")
         
         # Sampler
         horizon_cols = [f"y_geq_M_{h}h" for h in cfg.classifier.horizons]
@@ -590,8 +826,33 @@ def main():
         weights[labels] = cfg.train.sampler.positive_multiplier
         sampler = WeightedRandomSampler(torch.tensor(weights), len(weights))
         
-        train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=sampler, num_workers=0, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+        logger.info("  Creating DataLoaders...")
+        # MPS/Mac optimization: pin_memory can cause hangs
+        use_pin_memory = False if cfg.device == "mps" else True
+        
+        # Use persistent workers if num_workers > 0 to avoid respawn overhead
+        persistent_workers = cfg.train.num_workers > 0
+        
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=cfg.train.batch_size, 
+            sampler=sampler, 
+            num_workers=cfg.train.num_workers, 
+            pin_memory=use_pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=2 if cfg.train.num_workers > 0 else None
+        )
+        
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=cfg.train.batch_size, 
+            shuffle=False, 
+            num_workers=cfg.train.num_workers, 
+            pin_memory=use_pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=2 if cfg.train.num_workers > 0 else None
+        )
+        logger.info(f"  DataLoaders ready! Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     else:
         # Dummy fallback - use DummyPINNDataset defined in this module
         ds = DummyPINNDataset(cfg)

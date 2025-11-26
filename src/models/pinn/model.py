@@ -18,8 +18,8 @@ import torch.nn as nn
 from .config import PINNConfig
 from .core import PINNBackbone, ClassifierHead, B_perp_from_Az
 from .physics import WeakFormInduction2p5D, VectorInduction2p5D, VectorPhysicsResidualInfo
-from .losses import focal_loss, bce_logits, l1_data, curl_consistency_l1, interp_schedule
-from .collocation import mix_pil_uniform, clip_and_renorm_importance
+from .losses import focal_loss, bce_logits, l1_data, interp_schedule
+from .collocation import clip_and_renorm_importance
 
 
 @dataclass
@@ -92,6 +92,7 @@ class PINNModel(nn.Module):
             max_log2_freq=cfg.model.fourier.max_log2_freq,
             learn_eta=cfg.model.learn_eta,
             vector_B=vector_B,
+            hard_div_free=getattr(cfg.model, 'hard_div_free', False),
         )
         
         # Scalar features count from config (default: R-value, GWPIL, obs_coverage, frame_count)
@@ -112,26 +113,22 @@ class PINNModel(nn.Module):
         
         # Physics module: use VectorInduction2p5D for vector mode
         # Get physics config options
-        div_B_weight = getattr(cfg.physics, 'div_B_weight', 1.0)
-        component_weights = getattr(cfg.physics, 'component_weights', (1.0, 1.0, 1.0))
         
         if vector_B:
             self.physics = VectorInduction2p5D(
-                eta_bounds=(cfg.eta.min, cfg.eta.max),
-                use_resistive=cfg.physics.resistive,
-                include_boundary=cfg.physics.boundary_terms,
-                tv_eta=cfg.eta.tv_weight,
-                enforce_div_free_B=True,
-                div_B_weight=div_B_weight,
-                component_weights=component_weights,
+                physics_cfg=cfg.physics,
+                eta_cfg=cfg.eta,
+                n_fourier_modes=3,
+                n_random_tests=2,
             )
         else:
             # Legacy scalar physics (backward compatible via alias)
+            # WeakFormInduction2p5D extends VectorInduction2p5D with legacy return format
             self.physics = WeakFormInduction2p5D(
-                eta_bounds=(cfg.eta.min, cfg.eta.max),
-                use_resistive=cfg.physics.resistive,
-                include_boundary=cfg.physics.boundary_terms,
-                tv_eta=cfg.eta.tv_weight,
+                physics_cfg=cfg.physics,
+                eta_cfg=cfg.eta,
+                n_fourier_modes=3,
+                n_random_tests=2,
             )
         
         # Training state
@@ -210,24 +207,24 @@ class PINNModel(nn.Module):
         
         # Forward through backbone
         out = self.backbone(coords_flat)
-        A_z = out["A_z"]
-        eta_raw = out.get("eta_raw")
+        A_z = out.A_z
+        eta_raw = out.eta_raw
         
         # Handle vector vs scalar mode
         if self.vector_B:
             # Vector mode: B and u are packed tensors
-            B_vec = out["B"]         # [N, 3]
-            u_vec = out["u"]         # [N, 2]
-            B_x = out["B_x"]
-            B_y = out["B_y"]
-            B_z = out["B_z"]
-            u_x = out["u_x"]
-            u_y = out["u_y"]
+            B_vec = out.B         # [N, 3]
+            u_vec = out.u         # [N, 2]
+            B_x = out.B_x
+            B_y = out.B_y
+            B_z = out.B_z
+            u_x = out.u_x
+            u_y = out.u_y
         else:
             # Scalar mode (legacy)
-            B_z = out["B_z"]
-            u_x = out["u_x"]
-            u_y = out["u_y"]
+            B_z = out.B_z
+            u_x = out.u_x
+            u_y = out.u_y
             B_vec = None
             u_vec = None
             B_x, B_y = None, None
@@ -304,9 +301,6 @@ class PINNModel(nn.Module):
             # Use PIL mask if provided, otherwise uniform sampling
             if pil_mask is not None:
                 # PIL mask is [H, W] tensor (may be on GPU)
-                # FIXED: Handle tensor pil_mask properly (was treating as numpy)
-                from .collocation import mix_pil_uniform
-                
                 # Ensure pil_mask is a tensor on the correct device
                 if isinstance(pil_mask, np.ndarray):
                     pil_mask_tensor = torch.from_numpy(pil_mask).to(device).float()
@@ -348,7 +342,8 @@ class PINNModel(nn.Module):
                 imp_weights, _ = clip_and_renorm_importance(p_uniform, self.cfg.collocation.impw_clip_quantile)
             
             # ESS (Effective Sample Size) - measure of sampling efficiency
-            ess_val = float((imp_weights.sum() ** 2) / (imp_weights ** 2).sum().item())
+            w_sq_sum = (imp_weights ** 2).sum()
+            ess_val = float((imp_weights.sum() ** 2) / (w_sq_sum.item() + 1e-8))
             
             # Compute physics residual
             eta_mode = "field" if self.cfg.model.learn_eta else "scalar"
@@ -361,12 +356,17 @@ class PINNModel(nn.Module):
             )
             loss_phys = lambda_phys * loss_phys_raw
         
-        # 4. Optional curl consistency loss
+        # 4. Optional curl consistency loss (B_perp from Az vs direct prediction)
         loss_curl = torch.tensor(0.0, device=device)
         if mode == "train" and self.cfg.loss_weights.curl_consistency > 0 and B_x is not None:
-            # Compare B_perp from Az vs direct prediction (if we had Bx, By observations)
-            # For now, this is a placeholder; typically you'd have observed B_x, B_y
-            pass
+            # Compute B_perp from vector potential and compare with direct prediction
+            # B = curl(A) => Bx = -dAz/dy, By = dAz/dx
+            if A_z.requires_grad and coords_flat.requires_grad:
+                B_x_curl, B_y_curl = B_perp_from_Az(A_z, coords_flat)
+                loss_curl = (
+                    (B_x - B_x_curl).abs().mean() + 
+                    (B_y - B_y_curl).abs().mean()
+                )
         
         # Total loss
         loss_total = (

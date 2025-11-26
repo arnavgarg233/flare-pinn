@@ -26,19 +26,21 @@ Solenoidal constraint (div B = 0):
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
+from .config import EtaConfig, PhysicsConfig
 
 
 class VectorPhysicsResidualInfo(BaseModel):
-    """Diagnostic information from vector physics residual computation.
+    """Diagnostic information from vector physics residual computation."""
+    model_config = ConfigDict(frozen=True)
     
-    Tracks component-wise residuals for detailed physics analysis.
-    """
     # Component-wise induction residuals
     loss_induction_Bx: float
     loss_induction_By: float
@@ -48,7 +50,7 @@ class VectorPhysicsResidualInfo(BaseModel):
     # Solenoidal constraint (div B = 0)
     loss_divergence_B: float
     
-    # Optional velocity divergence (incompressibility)
+    # Velocity divergence (incompressibility)
     loss_divergence_u: float
     
     # Regularization
@@ -61,10 +63,6 @@ class VectorPhysicsResidualInfo(BaseModel):
     residual_Bx_max: float
     residual_By_max: float
     residual_Bz_max: float
-    
-    class Config:
-        """Pydantic config for frozen instances."""
-        frozen = True
 
 
 # Legacy dataclass for backward compatibility
@@ -171,8 +169,6 @@ class MultiScaleTestFunction(nn.Module):
         return phis, dphi_dx_list, dphi_dy_list
 
 
-from .config import PhysicsConfig, EtaConfig
-
 class VectorInduction2p5D(nn.Module):
     """
     Weak-form of 2.5D MHD Vector Induction Equation.
@@ -237,7 +233,7 @@ class VectorInduction2p5D(nn.Module):
         self.include_boundary = physics_cfg.boundary_terms
         
         # Vector physics options
-        self.enforce_div_free_u = False # Not in PhysicsConfig yet?
+        self.enforce_div_free_u = physics_cfg.enforce_div_free_u
         self.enforce_div_free_B = True
         self.div_B_weight = physics_cfg.div_B_weight
         self.component_weights = physics_cfg.component_weights
@@ -278,6 +274,23 @@ class VectorInduction2p5D(nn.Module):
         self.register_buffer("_By_scale_ema", torch.tensor(1.0))
         self.register_buffer("_Bz_scale_ema", torch.tensor(1.0))
     
+    @staticmethod
+    def _get_output_field(out: object, name: str) -> Optional[torch.Tensor]:
+        """
+        Safely fetch a field from mixed object/dict model outputs.
+        
+        Handles:
+            - attribute-style access (dataclass or SimpleNamespace outputs)
+            - dict-style access (legacy code paths)
+        """
+        if hasattr(out, name):
+            value = getattr(out, name)
+            if value is not None:
+                return value
+        if isinstance(out, dict):
+            return out.get(name)
+        return None
+    
     def _compute_spatial_gradients(
         self,
         field: torch.Tensor,
@@ -314,7 +327,6 @@ class VectorInduction2p5D(nn.Module):
                 only_inputs=True
             )[0]
         except RuntimeError as e:
-            import warnings
             warnings.warn(f"Gradient computation failed for {field_name}: {e}")
             zeros = torch.zeros_like(field)
             return zeros, zeros, zeros
@@ -605,28 +617,19 @@ class VectorInduction2p5D(nn.Module):
         """
         # Forward through model to get fields
         out = model(coords)
+        get_field = lambda name: self._get_output_field(out, name)
         
         # Handle both old (scalar) and new (vector) output formats
         # PINNBackboneOutput supports dict-style access or attribute access
-        if hasattr(out, "B") and out.B is not None:
+        B = get_field("B")
+        if B is not None:
             # New vector format: B is [N, 3]
-            B = out.B
-            Bx, By, Bz = B[..., 0:1], B[..., 1:2], B[..., 2:3]
-        elif "B" in out and out["B"] is not None:
-             # Legacy dict format
-            B = out["B"]
             Bx, By, Bz = B[..., 0:1], B[..., 1:2], B[..., 2:3]
         else:
-            # Legacy scalar format: only B_z available
-            # Handle object or dict access
-            Bz = getattr(out, "B_z", None)
-            if Bz is None: Bz = out.get("B_z")
-            
-            Bx = getattr(out, "B_x", None)
-            if Bx is None: Bx = out.get("B_x")
-            
-            By = getattr(out, "B_y", None)
-            if By is None: By = out.get("B_y")
+            # Legacy format: individual components
+            Bx = get_field("B_x")
+            By = get_field("B_y")
+            Bz = get_field("B_z")
             
             # If Bx, By not available, fall back to scalar-only physics
             if Bx is None or By is None:
@@ -634,26 +637,23 @@ class VectorInduction2p5D(nn.Module):
                     model, coords, imp_weights, out, eta_mode, eta_scalar
                 )
         
+        if Bz is None:
+            raise ValueError("Model output missing required magnetic field component B_z.")
+        
         # Get velocity components
-        if hasattr(out, "u") and out.u is not None:
+        u = get_field("u")
+        if u is not None:
             # New vector format: u is [N, 2]
-            u = out.u
-            ux, uy = u[..., 0:1], u[..., 1:2]
-        elif "u" in out and out["u"] is not None:
-            u = out["u"]
             ux, uy = u[..., 0:1], u[..., 1:2]
         else:
             # Legacy format
-            ux = getattr(out, "u_x", None)
-            if ux is None: ux = out["u_x"]
-            
-            uy = getattr(out, "u_y", None)
-            if uy is None: uy = out["u_y"]
+            ux = get_field("u_x")
+            uy = get_field("u_y")
+            if ux is None or uy is None:
+                raise ValueError("Model output missing required velocity fields (u_x, u_y).")
         
         # Get resistivity
-        eta_raw = getattr(out, "eta_raw", None)
-        if eta_raw is None and isinstance(out, dict):
-             eta_raw = out.get("eta_raw")
+        eta_raw = get_field("eta_raw")
              
         if eta_raw is not None and eta_mode == "field":
             eta = torch.sigmoid(eta_raw)
@@ -752,15 +752,20 @@ class VectorInduction2p5D(nn.Module):
                 0.5 * precision_Bz * loss_Bz + 0.5 * self.log_var_Bz
             )
         else:
-            # Fixed weights with robust normalization
-            # Use sqrt for scale compression instead of log1p (preserves gradient flow)
-            # sqrt(x) has derivative 1/(2*sqrt(x)) which stays bounded for small x
-            # and provides natural scale compression for large x
-            eps = 1e-8
+            # Fixed weights with robust normalization using smooth Huber-like scaling
+            # sqrt(x + delta^2) - delta has bounded gradients: x/sqrt(x + delta^2)
+            # This approaches 0 as x→0 (stable!) and 1 as x→∞ (linear scaling for large losses)
+            delta = 0.1  # Transition point between quadratic and linear regimes
+            delta_sq = delta * delta
+            
+            def smooth_scale(x: torch.Tensor) -> torch.Tensor:
+                """Numerically stable loss scaling with bounded gradients."""
+                return (x + delta_sq).sqrt() - delta
+            
             loss_induction = (
-                w_Bx * (loss_Bx + eps).sqrt() + 
-                w_By * (loss_By + eps).sqrt() + 
-                w_Bz * (loss_Bz + eps).sqrt()
+                w_Bx * smooth_scale(loss_Bx) + 
+                w_By * smooth_scale(loss_By) + 
+                w_Bz * smooth_scale(loss_Bz)
             )
         
         # Solenoidal constraint: ∇·B = ∂x·Bx + ∂y·By = 0
@@ -839,13 +844,16 @@ class VectorInduction2p5D(nn.Module):
         
         This maintains backward compatibility with models that only output Bz.
         """
-        Bz = out["B_z"]
-        ux = out["u_x"]
-        uy = out["u_y"]
+        Bz = self._get_output_field(out, "B_z")
+        ux = self._get_output_field(out, "u_x")
+        uy = self._get_output_field(out, "u_y")
+        if Bz is None or ux is None or uy is None:
+            raise ValueError("Model output missing required scalar physics fields (B_z, u_x, u_y).")
         
         # Get resistivity
-        if out.get("eta_raw") is not None and eta_mode == "field":
-            eta = torch.sigmoid(out["eta_raw"])
+        eta_raw = self._get_output_field(out, "eta_raw")
+        if eta_raw is not None and eta_mode == "field":
+            eta = torch.sigmoid(eta_raw)
             eta = self.eta_min + (self.eta_max - self.eta_min) * eta
             tv_reg = self.tv_eta * (eta ** 2).mean() if self.tv_eta > 0 else Bz.new_tensor(0.0)
         else:

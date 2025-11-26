@@ -6,17 +6,17 @@ Combines CNN spatial features with physics-informed coordinate fields.
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 
 from .collocation import clip_and_renorm_importance
 from .config import PINNConfig
-from .core import B_perp_from_Az, ClassifierHead
+from .core import ClassifierHead
 from .hybrid_core import HybridPINNBackbone
 from .losses import (
     asymmetric_focal_loss,
@@ -29,7 +29,7 @@ from .losses import (
     l1_data,
     poly_focal_loss,
 )
-from .physics import WeakFormInduction2p5D, VectorInduction2p5D
+from .physics import VectorInduction2p5D, WeakFormInduction2p5D
 
 
 # =============================================================================
@@ -163,16 +163,33 @@ class HybridPINNModel(nn.Module):
             n_scalar_features=n_scalar_features,
         )
         
-        # Physics module
-        self.physics = WeakFormInduction2p5D(
-            eta_bounds=(cfg.eta.min, cfg.eta.max),
-            use_resistive=cfg.physics.resistive,
-            include_boundary=cfg.physics.boundary_terms,
-            tv_eta=cfg.eta.tv_weight
-        )
+        # Physics module - use vector version for multi-component fields
+        # Both VectorInduction2p5D and WeakFormInduction2p5D now use config objects
+        if self.n_components > 1:
+            # Vector physics for multi-component fields
+            self.physics = VectorInduction2p5D(
+                physics_cfg=cfg.physics,
+                eta_cfg=cfg.eta,
+                n_fourier_modes=3,
+                n_random_tests=2,
+            )
+        else:
+            # Scalar physics for single-component (Bz only)
+            # WeakFormInduction2p5D is an alias for VectorInduction2p5D with legacy return type
+            self.physics = WeakFormInduction2p5D(
+                physics_cfg=cfg.physics,
+                eta_cfg=cfg.eta,
+                n_fourier_modes=3,
+                n_random_tests=2,
+            )
         
         # Training state
         self.register_buffer("_train_frac", torch.tensor(0.0))
+        
+        # Track class counts for class-balanced loss (updated during training)
+        self.register_buffer("_n_negative", torch.tensor(1000.0))
+        self.register_buffer("_n_positive", torch.tensor(50.0))
+        self._samples_seen = 0
     
     def _get_rf_weights(self, cfg: PINNConfig) -> Optional[torch.Tensor]:
         """Get RF importance weights from file or defaults."""
@@ -232,7 +249,6 @@ class HybridPINNModel(nn.Module):
             # Normalize to preserve feature scale
             return weights_tensor / weights_tensor.sum() * len(weights)
         except Exception as e:
-            import warnings
             warnings.warn(f"Failed to load RF weights from {path}: {e}. Using uniform weights.")
             return None
     
@@ -247,6 +263,46 @@ class HybridPINNModel(nn.Module):
         ramp = self.cfg.model.fourier.ramp_frac
         alpha = min(1.0, frac / ramp) if ramp > 0 else 1.0
         self.backbone.set_fourier_alpha(alpha)
+    
+    def set_mc_mode(self, enabled: bool) -> None:
+        """Enable/disable Monte Carlo dropout for uncertainty estimation."""
+        if hasattr(self.classifier, 'set_mc_mode'):
+            self.classifier.set_mc_mode(enabled)
+    
+    def predict_with_uncertainty(
+        self,
+        coords: torch.Tensor,
+        frames: Optional[torch.Tensor] = None,
+        observed_mask: Optional[torch.Tensor] = None,
+        scalars: Optional[torch.Tensor] = None,
+        n_samples: int = 10,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict with MC Dropout uncertainty estimation.
+        
+        Returns:
+            mean_probs: Mean predicted probabilities
+            std_probs: Uncertainty (standard deviation)
+        """
+        self.eval()
+        self.set_mc_mode(True)
+        
+        all_probs = []
+        with torch.no_grad():
+            for _ in range(n_samples):
+                out = self.forward(
+                    coords, frames=frames, observed_mask=observed_mask,
+                    scalars=scalars, mode="eval"
+                )
+                all_probs.append(out.probs)
+        
+        self.set_mc_mode(False)
+        
+        all_probs = torch.stack(all_probs)  # [n_samples, B, horizons]
+        mean_probs = all_probs.mean(dim=0)
+        std_probs = all_probs.std(dim=0)
+        
+        return mean_probs, std_probs
     
     def get_lambda_phys(self) -> float:
         """Get physics loss weight based on training progress."""
@@ -326,14 +382,36 @@ class HybridPINNModel(nn.Module):
             eta_raw=out["eta_raw"]
         )
     
+    def update_class_counts(self, labels: torch.Tensor) -> None:
+        """Update running class counts for class-balanced loss."""
+        with torch.no_grad():
+            # Count positives and negatives across all horizons
+            n_pos = labels.sum().item()
+            n_neg = labels.numel() - n_pos
+            
+            # Exponential moving average update
+            momentum = 0.99 if self._samples_seen > 100 else 0.5
+            self._n_positive.lerp_(torch.tensor(max(1.0, n_pos), device=labels.device), 1 - momentum)
+            self._n_negative.lerp_(torch.tensor(max(1.0, n_neg), device=labels.device), 1 - momentum)
+            self._samples_seen += 1
+    
     def compute_classification_loss(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
         probs: torch.Tensor,
-        samples_per_class: tuple[int, int] = (1000, 50)  # Estimated from data
     ) -> torch.Tensor:
         """Compute classification loss based on config."""
+        # Update class counts for class-balanced loss
+        if self.training:
+            self.update_class_counts(labels)
+        
+        # Get current class count estimates
+        samples_per_class = (
+            int(self._n_negative.item()),
+            int(self._n_positive.item())
+        )
+        
         label_smoothing = getattr(self.cfg.classifier, 'label_smoothing', 0.0)
         loss_type = self.cfg.classifier.loss_type
         
@@ -399,17 +477,21 @@ class HybridPINNModel(nn.Module):
         
         # gt_field: [B, T, P, C] (assuming batch dim added in forward)
         # B_field: [B*T*P, C] -> reshape
-        
         B_reshaped = B_field.reshape(B, T, P, -1)
         
-        # If gt has fewer components than pred, slice pred (or vice versa)?
-        # Assume they match for now due to dataset config.
-        if gt_field.shape[-1] != B_reshaped.shape[-1]:
-             # Fallback logic if dimensions mismatch (e.g. 1 vs 3)
-             # If pred is 1 (Bz) and gt is 3 (Bx,By,Bz), take Bz (index 2? or last?)
-             # Or if pred is 3 and gt is 1, take pred corresponding to Bz.
-             # This is tricky. We'll assume exact match for "data_loss" on "components".
-             pass
+        # Handle dimension mismatch between prediction and ground truth
+        pred_components = B_reshaped.shape[-1]
+        gt_components = gt_field.shape[-1]
+        
+        if pred_components != gt_components:
+            # Match dimensions: prefer using Bz which is the last component
+            if pred_components > gt_components:
+                # Prediction has more components - slice to match GT
+                # If GT is 1 component (Bz), take last component of prediction
+                B_reshaped = B_reshaped[..., -gt_components:]
+            else:
+                # GT has more components - slice GT to match prediction
+                gt_field = gt_field[..., -pred_components:]
              
         return l1_data(B_reshaped, gt_field, mask_expanded)
 
@@ -442,16 +524,10 @@ class HybridPINNModel(nn.Module):
         """
         Compute physics loss with optional gradient scaling.
         
+        Supports both scalar (Bz only) and vector (Bx, By, Bz) physics.
         Uses physics_grad_scale from config to prevent physics loss
         from dominating the classification objective.
         """
-        # This needs to handle the new backbone output format.
-        # For now, we skip full refactor of Physics module in this turn 
-        # and just return 0.0 if components != 1 to avoid crash.
-        if self.n_components != 1:
-            # Warning: Physics loss not yet adapted for vector fields
-            return torch.tensor(0.0, device=coords_flat.device), 0.0
-            
         device = coords_flat.device
         N = coords_flat.shape[0]
         alpha = self.get_collocation_alpha()
@@ -459,7 +535,6 @@ class HybridPINNModel(nn.Module):
         # Get physics gradient scale from config (default 0.5)
         physics_grad_scale = getattr(self.cfg.physics, 'physics_grad_scale', 0.5)
         
-        # ... (existing importance sampling code) ...
         # Compute importance weights
         if pil_mask is not None:
             xy_coords = coords_flat[:, :2]
@@ -500,14 +575,29 @@ class HybridPINNModel(nn.Module):
         # Wrap backbone to output compatible format for Physics module
         def model_wrapper(c):
             out = self.backbone(c, L, g, use_nearest=False)
-            # Physics module expects dictionary with "B_z", "u_x", "u_y", "eta_raw"
-            # Map from new "B", "u" to old keys
-            return {
-                "B_z": out["B"], # Assuming C=1
-                "u_x": out["u"][..., 0:1],
-                "u_y": out["u"][..., 1:2],
-                "eta_raw": out["eta_raw"]
-            }
+            
+            if self.n_components == 1:
+                # Scalar mode: B is Bz, map to old keys
+                return {
+                    "B_z": out["B"],
+                    "u_x": out["u"][..., 0:1],
+                    "u_y": out["u"][..., 1:2],
+                    "eta_raw": out["eta_raw"]
+                }
+            else:
+                # Vector mode: B is [Bx, By, Bz], u is [ux, uy]
+                B = out["B"]  # [N, 3]
+                u = out["u"]  # [N, 2]
+                return {
+                    "B": B,
+                    "u": u,
+                    "B_x": B[..., 0:1],
+                    "B_y": B[..., 1:2],
+                    "B_z": B[..., 2:3],
+                    "u_x": u[..., 0:1],
+                    "u_y": u[..., 1:2],
+                    "eta_raw": out["eta_raw"]
+                }
 
         loss_phys_raw, _ = self.physics(
             model_wrapper,
@@ -518,8 +608,6 @@ class HybridPINNModel(nn.Module):
         )
         
         # Apply physics gradient scaling to prevent dominating classification
-        # Uses GradientScaler-like approach: scale loss during forward, 
-        # effectively scaling gradients during backward
         scaled_loss = lambda_phys * loss_phys_raw * physics_grad_scale
         
         return scaled_loss, ess

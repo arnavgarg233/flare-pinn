@@ -26,12 +26,15 @@ from .losses import (
     focal_loss, focal_loss_with_label_smoothing, bce_logits, l1_data, 
     curl_consistency_l1, interp_schedule, asymmetric_focal_loss,
     mixup_data, mixup_criterion, TemperatureScaling, 
-    gradient_penalty, confidence_penalty
+    gradient_penalty, confidence_penalty,
+    class_balanced_focal_loss, poly_focal_loss,
 )
 from .physics import (
     WeakFormInduction2p5D,
+    VectorInduction2p5D,
     MultiScaleTestFunction,
     PhysicsResidualInfo,
+    VectorPhysicsResidualInfo,
     FreeEnergyProxy,
     CurrentHelicityProxy,
 )
@@ -82,6 +85,8 @@ __all__ = [
     "focal_loss",
     "focal_loss_with_label_smoothing",
     "asymmetric_focal_loss",
+    "class_balanced_focal_loss",
+    "poly_focal_loss",
     "bce_logits",
     "l1_data",
     "curl_consistency_l1",
@@ -93,8 +98,10 @@ __all__ = [
     "confidence_penalty",
     # Physics
     "WeakFormInduction2p5D",
+    "VectorInduction2p5D",
     "MultiScaleTestFunction",
     "PhysicsResidualInfo",
+    "VectorPhysicsResidualInfo",
     "FreeEnergyProxy",
     "CurrentHelicityProxy",
     # Collocation

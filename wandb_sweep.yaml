@@ -1,0 +1,91 @@
+program: tools/wandb_sweep_train.py
+method: bayes  # Bayesian optimization (GP-based, as per Snoek et al. 2012)
+metric:
+  name: val/tss_max
+  goal: maximize
+
+# BOHB-style: Bayesian + Hyperband early termination
+# Evidence: Falkner et al. (2018) - "best of both worlds"
+# - Bayesian: intelligent sampling (10-100× more efficient than random)
+# - Hyperband: early stopping (5-30× speedup vs. full training)
+# Based on jaxpi (Perdikaris Lab): 10k steps sufficient for PINN HPO ranking
+early_terminate:
+  type: hyperband
+  min_iter: 3000   # Bad configs show divergence early
+  max_iter: 15000  # ~15-20% of full training (jaxpi uses 10k for 100k final)
+  s: 2             # Bracket count
+  eta: 3           # Successive halving factor (keep top 1/3)
+
+parameters:
+  # TIER 1: Most Critical Parameters
+  
+  # Learning rate (log-uniform for exponential search)
+  train.lr:
+    distribution: log_uniform_values
+    min: 0.0003
+    max: 0.003
+  
+  # Physics schedule - ramp start point
+  physics_lambda_start_frac:
+    distribution: uniform
+    min: 0.3
+    max: 0.6
+  
+  # Physics schedule - final weight
+  physics_lambda_final:
+    distribution: uniform
+    min: 0.5
+    max: 3.0
+  
+  # Curl consistency weight (vector physics)
+  loss_weights.curl_consistency:
+    values: [0.0, 0.1, 0.2, 0.3, 0.5]
+  
+  # Batch size
+  train.batch_size:
+    values: [4, 8, 16]
+  
+  # Dropout regularization
+  classifier.dropout:
+    distribution: uniform
+    min: 0.1
+    max: 0.3
+  
+  # TIER 2: Important Parameters
+  
+  # Focal loss focusing parameter
+  classifier.focal_gamma:
+    distribution: uniform
+    min: 1.5
+    max: 3.0
+  
+  # Focal loss class weight
+  classifier.focal_alpha:
+    distribution: uniform
+    min: 0.2
+    max: 0.35
+  
+  # Learning rate warmup
+  train.scheduler.warmup_steps:
+    values: [500, 1000, 2000, 3000]
+  
+  # Label smoothing for calibration
+  classifier.label_smoothing:
+    values: [0.0, 0.05, 0.1]
+  
+  # Positive class oversampling
+  train.sampler.positive_multiplier:
+    distribution: uniform
+    min: 5.0
+    max: 20.0
+  
+  # PIL importance sampling strength
+  collocation.alpha_end:
+    distribution: uniform
+    min: 0.75
+    max: 0.95
+  
+  # Fourier feature curriculum
+  model.fourier.ramp_frac:
+    values: [0.3, 0.5, 0.7]
+

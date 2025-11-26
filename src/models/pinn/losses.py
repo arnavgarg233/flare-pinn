@@ -65,7 +65,11 @@ def l1_data(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tenso
         # Return 0 if no valid data (all masked), instead of NaN
         if denom == 1.0 and w.sum() == 0.0:
             return pred.new_tensor(0.0)
-        return (w * (pred - target).abs()).sum() / denom
+        
+        # FIXED: Use where() to avoid 0 * Inf = NaN issues
+        diff = (pred - target).abs()
+        masked_diff = torch.where(mask.bool(), diff, torch.zeros_like(diff))
+        return masked_diff.sum() / denom
     return (pred - target).abs().mean()
 
 def focal_loss_with_label_smoothing(
@@ -296,6 +300,107 @@ def gradient_penalty(
     penalty = ((grad_norm - 1).clamp(min=0) ** 2).mean()
     
     return weight * penalty
+
+
+def class_balanced_focal_loss(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    samples_per_class: tuple[int, int] = (1000, 50),
+    beta: float = 0.9999,
+    gamma: float = 2.0
+) -> torch.Tensor:
+    """
+    Class-Balanced Focal Loss (Cui et al., 2019).
+    
+    Combines class-balanced re-weighting with focal loss for extreme imbalance.
+    Much more effective than standard focal loss for 1:50 imbalance.
+    
+    The effective number of samples is: E_n = (1 - β^n) / (1 - β)
+    This captures the diminishing returns of more samples for majority class.
+    
+    Args:
+        logits: Raw predictions [N, C]
+        y: Binary targets [N, C]  
+        samples_per_class: (n_negative, n_positive) sample counts
+        beta: Hyperparameter in [0, 1). Higher = more weighting. 0.9999 for extreme imbalance.
+        gamma: Focal loss focusing parameter
+        
+    Returns:
+        loss: Scalar class-balanced focal loss
+    """
+    n_neg, n_pos = samples_per_class
+    
+    # Effective number of samples
+    def effective_num(n: int, beta: float) -> float:
+        if beta == 1.0:
+            return float(n)
+        return (1.0 - beta ** n) / (1.0 - beta)
+    
+    E_neg = effective_num(n_neg, beta)
+    E_pos = effective_num(n_pos, beta)
+    
+    # Class-balanced weights (inversely proportional to effective number)
+    w_neg = 1.0 / E_neg
+    w_pos = 1.0 / E_pos
+    
+    # Normalize so weights sum to 2 (for binary classification)
+    total = w_neg + w_pos
+    w_neg = 2.0 * w_neg / total
+    w_pos = 2.0 * w_pos / total
+    
+    # Compute focal loss with class-balanced weights
+    bce_loss = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+    
+    probs = torch.sigmoid(logits).clamp(1e-7, 1 - 1e-7)
+    p_t = probs * y + (1 - probs) * (1 - y)
+    focal_weight = ((1 - p_t) ** gamma).clamp(max=100.0)
+    
+    # Apply class-balanced weights
+    cb_weight = w_pos * y + w_neg * (1 - y)
+    
+    loss = cb_weight * focal_weight * bce_loss
+    return loss.mean()
+
+
+def poly_focal_loss(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    epsilon: float = 1.0,
+    alpha: float = 0.25,
+    gamma: float = 2.0
+) -> torch.Tensor:
+    """
+    PolyLoss + Focal Loss (Leng et al., 2022).
+    
+    Adds polynomial correction term that helps with calibration
+    and improves performance on imbalanced datasets.
+    
+    L_poly = L_focal + ε * (1 - p_t)
+    
+    Args:
+        logits: Raw predictions [N, C]
+        y: Binary targets [N, C]
+        epsilon: Polynomial coefficient (1.0 works well)
+        alpha: Focal loss alpha
+        gamma: Focal loss gamma
+        
+    Returns:
+        loss: Scalar polyloss
+    """
+    probs = torch.sigmoid(logits).clamp(1e-7, 1 - 1e-7)
+    
+    # Standard focal loss
+    bce_loss = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+    p_t = probs * y + (1 - probs) * (1 - y)
+    alpha_t = alpha * y + (1 - alpha) * (1 - y)
+    focal_weight = ((1 - p_t) ** gamma).clamp(max=100.0)
+    focal_loss = alpha_t * focal_weight * bce_loss
+    
+    # Polynomial correction
+    poly_term = epsilon * (1 - p_t)
+    
+    loss = focal_loss + poly_term
+    return loss.mean()
 
 
 def confidence_penalty(

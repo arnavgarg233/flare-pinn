@@ -55,17 +55,16 @@ physics:
   resistive: true          # Full resistive MHD induction equation
   boundary_terms: false
   
-  # SOTA: Very aggressive physics curriculum
-  # Key insight: Physics must shape representations strongly
-  # Start early (not at 0!) and ramp up very high
+  # FIXED: Physics starts at ZERO to prevent NaN!
+  # Key insight: Classifier must converge first, then physics shapes features
   lambda_phys_schedule:
-    - [0.0, 1.0]           # Start with physics immediately (not 0!)
-    - [0.1, 2.5]           # Ramp up quickly by 10%
-    - [0.2, 5.0]           # Strong by 20%
-    - [0.4, 10.0]          # Very strong by 40%
-    - [0.6, 15.0]          # Dominant by 60%
-    - [0.8, 20.0]          # Very dominant
-    - [1.0, 25.0]          # Maximum physics at end (the model IS the physics)
+    - [0.0, 0.0]           # NO physics at start (prevents NaN!)
+    - [0.15, 0.0]          # Still zero during classifier warm-up
+    - [0.25, 0.5]          # Start introducing physics gently
+    - [0.4, 2.0]           # Moderate physics
+    - [0.6, 5.0]           # Stronger physics
+    - [0.8, 10.0]          # Strong physics
+    - [1.0, 15.0]          # Maximum (capped by code)
 
 eta:
   min: 1.0e-5              # Lower bound for learned eta
@@ -87,7 +86,7 @@ train:
   steps: 60000             # Longer training for physics convergence
   batch_size: 1            # Single sample (PINN requires per-sample physics)
   lr: 2.0e-4               # Lower LR for stability with strong physics
-  grad_clip: 0.3           # Tighter gradient clipping
+  grad_clip: 3.0           # FIXED: More permissive (was 0.3, too aggressive)
   amp: false               # Disable AMP for MPS compatibility
   log_every: 100
   eval_every: 2000
@@ -99,10 +98,12 @@ train:
     warmup_steps: 4000     # Longer warmup for stability with physics
     min_lr: 1.0e-6
   
+  num_workers: 4           # Parallel data loading to avoid I/O bottleneck
+  
   sampler:
     strategy: "class_balanced"
-    positive_multiplier: 150.0   # SOTA: Very aggressive oversampling
-    smoothing: 0.2               # Moderate smoothing on weights
+    positive_multiplier: 40.0    # FIXED: More moderate (was 150, too aggressive)
+    smoothing: 0.35              # Moderate smoothing on weights
   
   use_ema: true
   ema_decay: 0.9997        # Very slow EMA for best generalization

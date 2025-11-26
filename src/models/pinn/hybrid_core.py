@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-from .core import FourierFeatures, fourier_out_dim, ClassifierHead
+from .core import FourierFeatures, fourier_out_dim
 from .encoder import TinyEncoder, TemporalEncoder
 from .latent_sampling import sample_latent_soft_bilinear, sample_latent_nearest
 from .film import FiLM
@@ -42,11 +42,13 @@ class HybridPINNBackbone(nn.Module):
         film_layers: tuple[int, ...] = (3, 6, 9),
         learn_eta: bool = False,
         encoder_dropout: float = 0.05,
-        use_temporal_encoder: bool = True
+        use_temporal_encoder: bool = True,
+        n_field_components: int = 1,
     ):
         super().__init__()
         
         self.use_temporal_encoder = use_temporal_encoder
+        self.n_field_components = n_field_components
         
         if use_temporal_encoder:
             # Advanced temporal encoder
@@ -75,7 +77,23 @@ class HybridPINNBackbone(nn.Module):
         
         # Input: [x, y, t, FF, L_sampled, g]
         in_dim = 3 + ff_dim + self.effective_latent_channels + global_dim
-        out_dim = 5 if learn_eta else 4
+        
+        # Output dimension:
+        # A (potential): n_field_components (scalar potential for 2D B, vector for 3D B?)
+        # Actually for 2.5D:
+        # If 1 comp (Bz) -> Az (1) + Bz (1) + ux, uy (2) = 4
+        # If 3 comp (Bx,By,Bz) -> B (3) + u (3?) + A (3?)
+        # For minimal refactor:
+        # Always output:
+        # - A (potential): n_field_components
+        # - B (field): n_field_components
+        # - u (velocity): 2 (assuming 2.5D flow) or 3? Sticking to 2 for now as u_x, u_y are hardcoded elsewhere.
+        # - eta: 1 if learned
+        
+        self.n_u = 2 # ux, uy
+        out_dim = n_field_components * 2 + self.n_u
+        if learn_eta:
+            out_dim += 1
         
         # Coordinate MLP with FiLM conditioning
         self.film_layers = set(film_layers)
@@ -113,7 +131,7 @@ class HybridPINNBackbone(nn.Module):
         Encode observed frames into latent features.
         
         Args:
-            frames: [T, H, W] or [1, 1, H, W] depending on encoder
+            frames: [T, C, H, W] or [1, C, H, W]
             observed_mask: [T] boolean mask (required for TemporalEncoder)
         
         Returns:
@@ -145,11 +163,7 @@ class HybridPINNBackbone(nn.Module):
             use_nearest: If True, use nearest-neighbor sampling (faster, no coord gradients)
         
         Returns:
-            dict with A_z, B_z, u_x, u_y, eta_raw (each [N, 1])
-            
-        Note:
-            Now uses manual bilinear/nearest sampling that supports 2nd-order gradients.
-            Physics loss can train the CNN encoder end-to-end!
+            dict with A, B, u, eta_raw (tensors)
         """
         N = coords.shape[0]
         
@@ -190,17 +204,34 @@ class HybridPINNBackbone(nn.Module):
         # Output head
         out = self.head(h)
         
+        # Split outputs
+        # Layout: [A (C), B (C), u (2), eta (1?)]
+        C = self.n_field_components
+        
+        start = 0
+        A = out[..., start:start+C]
+        start += C
+        B_field = out[..., start:start+C]
+        start += C
+        u = out[..., start:start+self.n_u]
+        start += self.n_u
+        
         if self.learn_eta:
-            A_z, B_z, u_x, u_y, eta_raw = torch.split(out, 1, dim=-1)
+            eta_raw = out[..., start:start+1]
         else:
-            A_z, B_z, u_x, u_y = torch.split(out, 1, dim=-1)
             eta_raw = None
         
+        # Back-compat: map 1-component result to explicit Bz/Az keys if N=1
+        # But new API prefers "B", "A", "u"
         return {
-            "A_z": A_z,
-            "B_z": B_z,
-            "u_x": u_x,
-            "u_y": u_y,
-            "eta_raw": eta_raw
+            "A": A,
+            "B": B_field,
+            "u": u,
+            "eta_raw": eta_raw,
+            # Keep old keys for safety if needed (only valid for C=1)
+            "A_z": A if C == 1 else None,
+            "B_z": B_field if C == 1 else None,
+            "u_x": u[..., 0:1],
+            "u_y": u[..., 1:2]
         }
 

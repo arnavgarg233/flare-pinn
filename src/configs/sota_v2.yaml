@@ -1,0 +1,134 @@
+# =============================================================================
+# SOTA V2 CONFIG - Phase 2: Physics-Enhanced Training
+# =============================================================================
+# USE AFTER baseline_sota.yaml achieves TSS > 0.50!
+#
+# Key Improvements:
+# 1. Physics enabled with GRADUAL schedule (starts at 0!)
+# 2. Pretrained from baseline checkpoint
+# 3. Lower learning rate for fine-tuning
+# 4. Stronger physics at later stages
+# 5. All SOTA features enabled
+#
+# Expected Performance: TSS > 0.75 at 24h horizon
+# =============================================================================
+
+seed: 42
+device: "mps"  # Change to "cuda" for NVIDIA GPUs
+
+model:
+  model_type: "hybrid"
+  hidden: 384              # Larger for physics capacity
+  layers: 8                # Deeper network
+  learn_eta: true          # Enable learned resistivity
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 5       # Higher frequencies for PIL detail
+    ramp_frac: 0.2         # Faster ramp since model is pretrained
+
+classifier:
+  hidden: 192              # Larger classifier
+  dropout: 0.25            # Moderate dropout
+  horizons: [6, 12, 24]
+  
+  # SOTA: Asymmetric focal loss for imbalanced data
+  loss_type: "asymmetric"
+  focal_alpha: 0.75        # Weight for positive class
+  focal_gamma: 1.5         # Mild focusing on positives
+  asymmetric_gamma_neg: 4.0  # Strong focusing on hard negatives
+  
+  # SOTA: Label smoothing for calibration
+  label_smoothing: 0.05
+  
+  # SOTA: Confidence penalty for calibration
+  confidence_penalty: 0.02
+  
+  # All SOTA features enabled
+  use_attention: true
+  use_physics_features: true
+  use_rf_guidance: true    # Domain knowledge weighting
+  
+  pos_weight: null
+
+# ====== PHYSICS ENABLED WITH GRADUAL SCHEDULE ======
+physics:
+  enable: true
+  resistive: true          # Full resistive MHD
+  boundary_terms: false
+  
+  # CRITICAL: Physics starts at ZERO and ramps up gradually!
+  # This prevents the NaN issues you were seeing
+  lambda_phys_schedule:
+    - [0.0, 0.0]           # NO physics at start
+    - [0.15, 0.0]          # Still zero (classifier warm-up)
+    - [0.25, 0.5]          # Start introducing physics
+    - [0.4, 1.5]           # Moderate physics
+    - [0.6, 3.0]           # Stronger physics
+    - [0.8, 5.0]           # Strong physics
+    - [1.0, 8.0]           # Maximum (but capped at 50 by code)
+
+eta:
+  min: 1.0e-5              # Lower bound
+  max: 2.0                 # Upper bound
+  tv_weight: 1.0e-3        # TV regularization
+
+loss_weights:
+  cls: 3.0                 # Higher classification weight
+  data: 1.0                # Data fitting
+  curl_consistency: 0.1    # Curl consistency
+
+collocation:
+  n_max: 12288             # More collocation points
+  alpha_start: 0.6         # PIL focus from start
+  alpha_end: 0.9           # Strong PIL focus at end
+  impw_clip_quantile: 0.995
+
+train:
+  steps: 40000             # Longer training for physics
+  batch_size: 1
+  lr: 2.0e-4               # Lower LR for fine-tuning
+  grad_clip: 3.0           # Tighter gradient clipping for physics
+  amp: false
+  log_every: 100
+  eval_every: 1000
+  checkpoint_every: 5000
+  checkpoint_dir: "outputs/checkpoints/sota_v2"
+  
+  scheduler:
+    type: "cosine"
+    warmup_steps: 3000     # Longer warmup for physics
+    min_lr: 1.0e-6
+  
+  num_workers: 4           # Parallel data loading to avoid I/O bottleneck
+  
+  sampler:
+    strategy: "class_balanced"
+    positive_multiplier: 50.0  # Moderate-high oversampling
+    smoothing: 0.3
+  
+  use_ema: true
+  ema_decay: 0.9995        # Slow EMA for better generalization
+
+data:
+  use_real: true
+  windows_parquet: "data/interim/windows_train.parquet"
+  frames_meta_parquet: "/Volumes/Lexar/flare_forecasting/frames_meta.parquet"
+  npz_root: "/Volumes/Lexar/flare_forecasting/frames"
+  target_size: 96          # Higher resolution for physics
+  input_hours: 48          # Full history
+  P_per_t: 768             # More points for physics
+  pil_top_pct: 0.12        # Tighter PIL threshold
+  val_fraction: 0.12
+  
+  scalar_features:
+    - frame_count_in_window
+    - obs_coverage
+    - horizon_coverage_6h
+    - horizon_coverage_12h
+    - horizon_coverage_24h
+
+  dummy_T: 8
+  dummy_H: 64
+  dummy_W: 64
+  dummy_num_samples: 2048
+

@@ -1,0 +1,100 @@
+# ============================================================================
+# LAPTOP TEST CONFIG - Hardware Discovery
+# ============================================================================
+# PURPOSE: Quick test to measure YOUR laptop's training speed
+#
+# Run this FIRST to determine:
+# 1. Steps/second on your hardware
+# 2. Memory usage (does it fit?)
+# 3. Training stability (any NaN?)
+# 4. Early TSS baseline
+#
+# Usage:
+#   python src/train.py --config src/configs/laptop_test.yaml
+#
+# Expected runtime: 30-60 minutes
+# ============================================================================
+
+seed: 42
+device: "mps"  # Auto-detected, or change to "cuda"/"cpu"
+
+model:
+  model_type: hybrid
+  hidden: 256        # Smaller for speed
+  layers: 6          # Shallower for speed
+  learn_eta: false
+  in_channels: 3     # Vector magnetogram
+  fourier:
+    max_log2_freq: 4
+    ramp_frac: 0.5
+
+classifier:
+  hidden: 128        # Smaller
+  dropout: 0.15
+  horizons: [6, 12, 24]
+  loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  use_attention: true
+  use_physics_features: true
+  label_smoothing: 0.05
+  confidence_penalty: 0.05
+
+physics:
+  enable: true
+  resistive: true
+  boundary_terms: false
+  # Gentle physics schedule for testing
+  lambda_phys_schedule: [[0.0, 0.0], [0.5, 0.0], [0.9, 0.5], [1.0, 1.0]]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.1  # Low for speed
+
+collocation:
+  n_max: 10000       # Half the normal
+  alpha_start: 0.5
+  alpha_end: 0.9
+  impw_clip_quantile: 0.99
+
+train:
+  steps: 2000        # Just 2000 steps for testing
+  batch_size: 4      # Conservative (fits in 16GB)
+  num_workers: 2     # Conservative
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: true
+  log_every: 50      # Log frequently to monitor
+  eval_every: 500
+  checkpoint_every: 10000  # Don't checkpoint during test
+  checkpoint_dir: outputs/checkpoints/laptop_test
+  scheduler:
+    type: cosine
+    warmup_steps: 200
+    min_lr: 1.0e-6
+  sampler:
+    strategy: class_balanced
+    positive_multiplier: 10.0
+    smoothing: 0.5
+  use_ema: false  # Skip EMA for speed
+
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: ~/flare_data/consolidated
+  windows_parquet: /Volumes/Lexar/flare_forecasting/windows_meta.parquet
+  frames_meta_parquet: /Volumes/Lexar/flare_forecasting/frames_meta.parquet
+  npz_root: /Volumes/Lexar/flare_forecasting/frames
+  target_size: 128
+  input_hours: 48
+  P_per_t: 512       # Half the normal (faster)
+  pil_top_pct: 0.15
+  val_fraction: 0.15
+  scalar_features: ["r_value", "gwpil", "obs_coverage", "frame_count"]
+

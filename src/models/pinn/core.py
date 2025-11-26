@@ -3,7 +3,10 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
+
+from dataclasses import dataclass
 
 # ---------------- Fourier Features ---------------- #
 
@@ -41,14 +44,74 @@ def fourier_out_dim(in_dim: int = 3, max_log2_freq: int = 5) -> int:
 
 # ---------------- Backbone (coordinate MLP) ---------------- #
 
+class ResBlock(nn.Module):
+    """Residual block for deeper gradient flow."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
 def _mlp(in_dim: int, hidden: int, out_dim: int, layers: int) -> nn.Sequential:
-    mods = []
-    d = in_dim
-    for _ in range(layers):
-        mods += [nn.Linear(d, hidden), nn.SiLU()]
-        d = hidden
-    mods += [nn.Linear(d, out_dim)]
+    """
+    Constructs a ResNet-style MLP for better trainability at depth.
+    
+    Args:
+        in_dim: Input dimension
+        hidden: Hidden dimension
+        out_dim: Output dimension
+        layers: Number of hidden layers (approximate, will be converted to blocks)
+    """
+    # Input projection
+    mods = [nn.Linear(in_dim, hidden), nn.SiLU()]
+    
+    # Residual blocks
+    # Each block contains 2 layers. 
+    # We replace (layers-1) plain layers with (layers-1)//2 blocks.
+    n_blocks = max(1, (layers - 1) // 2)
+    
+    for _ in range(n_blocks):
+        mods.append(ResBlock(hidden))
+    
+    # Handle odd number of layers (optional, just to stay close to requested depth)
+    if (layers - 1) % 2 != 0:
+        mods.extend([nn.Linear(hidden, hidden), nn.SiLU()])
+        
+    # Output projection
+    mods.append(nn.Linear(hidden, out_dim))
     return nn.Sequential(*mods)
+
+
+@dataclass
+class PINNBackboneOutput:
+    """Standardized output from PINN backbone."""
+    # Common fields
+    A_z: torch.Tensor
+    u_x: torch.Tensor
+    u_y: torch.Tensor
+    eta_raw: Optional[torch.Tensor] = None
+    
+    # Scalar mode specific
+    B_z: Optional[torch.Tensor] = None
+    
+    # Vector mode specific
+    B: Optional[torch.Tensor] = None        # Packed [N, 3]
+    u: Optional[torch.Tensor] = None        # Packed [N, 2]
+    B_x: Optional[torch.Tensor] = None
+    B_y: Optional[torch.Tensor] = None
+    
+    def __getitem__(self, key: str) -> Optional[torch.Tensor]:
+        """Backward compatibility for dict-like access."""
+        return getattr(self, key)
+    
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
 
 
 class PINNBackbone(nn.Module):
@@ -68,6 +131,7 @@ class PINNBackbone(nn.Module):
         max_log2_freq: int = 5, 
         learn_eta: bool = False,
         vector_B: bool = False,
+        hard_div_free: bool = False,
     ):
         """
         Args:
@@ -76,6 +140,7 @@ class PINNBackbone(nn.Module):
             max_log2_freq: Maximum Fourier frequency (log2)
             learn_eta: Learn spatially-varying resistivity
             vector_B: Output 3-component B field (Bx, By, Bz) instead of just Bz
+            hard_div_free: Enforce div B = 0 by deriving B from A (requires vector_B=True)
         """
         super().__init__()
         self.ff = FourierFeatures(3, max_log2_freq)
@@ -83,6 +148,7 @@ class PINNBackbone(nn.Module):
         
         self.vector_B = vector_B
         self.learn_eta = learn_eta
+        self.hard_div_free = hard_div_free
         
         # Compute output dimension:
         # - A_z: 1
@@ -90,8 +156,13 @@ class PINNBackbone(nn.Module):
         # - u: 2
         # - eta_raw: 1 (optional)
         if vector_B:
-            # Vector mode: Az(1) + B(3) + u(2) + [eta(1)] = 6 or 7
-            out_dim = 6 + (1 if learn_eta else 0)
+            if hard_div_free:
+                # Hard div-free mode: Az(1) + Bz(1) + u(2) + [eta(1)]
+                # Bx, By are derived from Az, so we don't output them directly
+                out_dim = 4 + (1 if learn_eta else 0)
+            else:
+                # Vector mode: Az(1) + B(3) + u(2) + [eta(1)] = 6 or 7
+                out_dim = 6 + (1 if learn_eta else 0)
         else:
             # Scalar mode: Az(1) + Bz(1) + ux(1) + uy(1) + [eta(1)] = 4 or 5
             out_dim = 4 + (1 if learn_eta else 0)
@@ -101,7 +172,7 @@ class PINNBackbone(nn.Module):
     def set_fourier_alpha(self, a: float) -> None:
         self.ff.set_alpha(a)
 
-    def forward(self, coords: torch.Tensor) -> dict[str, Optional[torch.Tensor]]:
+    def forward(self, coords: torch.Tensor) -> PINNBackboneOutput:
         """
         Forward pass.
         
@@ -109,41 +180,47 @@ class PINNBackbone(nn.Module):
             coords: [N, 3] coordinates with requires_grad=True for autograd derivatives
             
         Returns:
-            Dictionary with fields:
-            - Vector mode: {"A_z", "B", "u", "eta_raw", "B_x", "B_y", "B_z", "u_x", "u_y"}
-            - Scalar mode: {"A_z", "B_z", "u_x", "u_y", "eta_raw"}
-            
-            Vector mode provides both packed vectors (B, u) and unpacked components
-            for backward compatibility.
+            PINNBackboneOutput object with fields:
+            - Vector mode: A_z, B, u, eta_raw, B_x, B_y, B_z, u_x, u_y
+            - Scalar mode: A_z, B_z, u_x, u_y, eta_raw
         """
         h = self.ff(coords)
         out = self.net(h)
         
         if self.vector_B:
-            # Vector mode: unpack A_z(1), B(3), u(2), [eta(1)]
-            if self.learn_eta:
-                A_z, Bx, By, Bz, ux, uy, eta_raw = torch.split(out, 1, dim=-1)
+            if self.hard_div_free:
+                # Hard div-free mode: unpack Az(1), Bz(1), u(2), [eta(1)]
+                if self.learn_eta:
+                    A_z, Bz, ux, uy, eta_raw = torch.split(out, 1, dim=-1)
+                else:
+                    A_z, Bz, ux, uy = torch.split(out, 1, dim=-1)
+                    eta_raw = None
+                
+                # Derive Bx, By from Az to strictly enforce div B = 0
+                Bx, By = B_perp_from_Az(A_z, coords)
             else:
-                A_z, Bx, By, Bz, ux, uy = torch.split(out, 1, dim=-1)
-                eta_raw = None
+                # Vector mode: unpack A_z(1), B(3), u(2), [eta(1)]
+                if self.learn_eta:
+                    A_z, Bx, By, Bz, ux, uy, eta_raw = torch.split(out, 1, dim=-1)
+                else:
+                    A_z, Bx, By, Bz, ux, uy = torch.split(out, 1, dim=-1)
+                    eta_raw = None
             
             # Pack into vectors for new physics module
             B = torch.cat([Bx, By, Bz], dim=-1)  # [N, 3]
             u = torch.cat([ux, uy], dim=-1)      # [N, 2]
             
-            return {
-                # New vector format
-                "A_z": A_z,
-                "B": B,           # [N, 3] packed vector
-                "u": u,           # [N, 2] packed vector
-                "eta_raw": eta_raw,
-                # Legacy unpacked format (for backward compatibility)
-                "B_x": Bx,
-                "B_y": By,
-                "B_z": Bz,
-                "u_x": ux,
-                "u_y": uy,
-            }
+            return PINNBackboneOutput(
+                A_z=A_z,
+                B=B,
+                u=u,
+                eta_raw=eta_raw,
+                B_x=Bx,
+                B_y=By,
+                B_z=Bz,
+                u_x=ux,
+                u_y=uy
+            )
         else:
             # Scalar mode (legacy): unpack A_z(1), B_z(1), ux(1), uy(1), [eta(1)]
             if self.learn_eta:
@@ -152,13 +229,13 @@ class PINNBackbone(nn.Module):
                 A_z, B_z, u_x, u_y = torch.split(out, 1, dim=-1)
                 eta_raw = None
             
-            return {
-                "A_z": A_z, 
-                "B_z": B_z, 
-                "u_x": u_x, 
-                "u_y": u_y, 
-                "eta_raw": eta_raw
-            }
+            return PINNBackboneOutput(
+                A_z=A_z,
+                B_z=B_z,
+                u_x=u_x,
+                u_y=u_y,
+                eta_raw=eta_raw
+            )
 
 # ---------------- Helpers (hard in-plane solenoidality) ---------------- #
 
@@ -426,14 +503,53 @@ class PhysicsFeatureExtractor(nn.Module):
             shear_mean = torch.zeros_like(bz_mean)
             free_energy_mean = torch.zeros_like(bz_mean)
 
-        # Concatenate base physics features (now 13 features when vector field available)
+        # Magnetic complexity metric: kurtosis proxy
+        # High kurtosis indicates non-Gaussian, complex field configurations
+        bz_4th = torch.where(mask_bool, B_z ** 4, torch.zeros_like(B_z))
+        bz_4th_mean = bz_4th.sum(dim=(1, 2, 3)) / valid_count
+        kurtosis_proxy = bz_4th_mean / (bz_var ** 2 + 1e-8)
+        
+        # SOTA: Current helicity proxy (if we have horizontal field)
+        # Hc = Jz * Bz where Jz ≈ curl(B)_z = ∂By/∂x - ∂Bx/∂y
+        # We can't compute gradients here directly, so use variance ratio as proxy
+        if "B_x" in feats and "B_y" in feats:
+            B_x = feats["B_x"]
+            B_y = feats["B_y"]
+            # Twist proxy: |Bh| * |Bz| correlation (high for helical fields)
+            bh_mag = (B_x**2 + B_y**2 + 1e-8).sqrt()
+            twist_proxy = torch.where(mask_bool, bh_mag * B_z.abs(), torch.zeros_like(bh_mag))
+            current_helicity_proxy = twist_proxy.sum(dim=(1, 2, 3)) / valid_count
+        else:
+            current_helicity_proxy = torch.zeros_like(bz_mean)
+        
+        # SOTA: Recent evolution rate (weighted towards latest frames)
+        # More weight on recent changes as they're most predictive
+        if T > 1:
+            # Exponentially weighted mean of |dBz/dt|
+            time_weights = torch.exp(torch.linspace(-2, 0, T-1, device=B_z.device))
+            time_weights = time_weights / time_weights.sum()
+            dBz_dt = (B_z[:, 1:] - B_z[:, :-1]).abs()
+            mask_dt = mask_float[:, 1:] * mask_float[:, :-1]
+            
+            # Apply time weighting
+            weighted_dBz = dBz_dt * time_weights[None, :, None, None] * mask_dt
+            recent_evolution = weighted_dBz.sum(dim=(1, 2, 3)) / (mask_dt.sum(dim=(1, 2, 3)) * time_weights.sum() + 1e-8)
+        else:
+            recent_evolution = torch.zeros(B, device=B_z.device)
+        
+        # Concatenate ALL physics features (now 18 features for comprehensive physics)
         physics_feats = torch.stack([
+            # Base field statistics (4)
             bz_mean, bz_std, bz_max, polarity_balance,
+            # Flow statistics (3)
             u_mean, u_max, flux_transport,
-            temporal_var, az_std,
-            bh_mean, btot_mean,
-            shear_mean, free_energy_mean  # NEW: critical for flare prediction
-        ], dim=-1)  # [B, 13]
+            # Temporal features (4) - ENHANCED
+            temporal_var, temporal_accel, evolution_rate_var, recent_evolution,
+            # Field complexity (2)
+            az_std, kurtosis_proxy,
+            # Vector field features (5) - if available
+            bh_mean, btot_mean, shear_mean, free_energy_mean, current_helicity_proxy
+        ], dim=-1)  # [B, 18]
         
         # Handle any NaN that might occur
         physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -441,9 +557,36 @@ class PhysicsFeatureExtractor(nn.Module):
         return physics_feats
 
 
+class MCDropout(nn.Module):
+    """
+    Monte Carlo Dropout layer that stays active during inference.
+    
+    Used for uncertainty quantification following Gal & Ghahramani (2016).
+    """
+    def __init__(self, p: float = 0.2):
+        super().__init__()
+        self.p = p
+        self._mc_mode = False
+    
+    def set_mc_mode(self, enabled: bool):
+        """Enable/disable MC dropout mode for inference."""
+        self._mc_mode = enabled
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Active during training OR when mc_mode is enabled
+        if self.training or self._mc_mode:
+            return F.dropout(x, self.p, training=True)
+        return x
+
+
 class ClassifierHead(nn.Module):
     """
     Advanced classifier head with attention and physics features.
+    
+    SOTA improvements:
+    - MC Dropout for uncertainty quantification
+    - Enhanced feature aggregation
+    - RF-guided physics feature weighting
     """
     def __init__(
         self, 
@@ -454,12 +597,15 @@ class ClassifierHead(nn.Module):
         use_physics_features: bool = True,
         rf_importance_weights: Optional[torch.Tensor] = None,
         n_scalar_features: int = 4,
+        mc_dropout: bool = False,
+        mc_dropout_rate: float = 0.2,
     ):
         super().__init__()
         self.horizons = tuple(horizons)
         self.use_attention = use_attention
         self.use_physics_features = use_physics_features
         self.n_scalar_features = n_scalar_features
+        self.mc_dropout_enabled = mc_dropout
         
         # Base features: A_z, B_z, u_x, u_y
         base_features = 4
@@ -472,7 +618,7 @@ class ClassifierHead(nn.Module):
         # Physics feature extractor
         if use_physics_features:
             self.physics_extractor = PhysicsFeatureExtractor()
-            physics_features = 13  # Updated: includes shear and free energy proxies
+            physics_features = PhysicsFeatureExtractor.N_FEATURES  # 18 features
         else:
             physics_features = 0
         
@@ -484,17 +630,8 @@ class ClassifierHead(nn.Module):
             # Default: uniform weights
             self.register_buffer('rf_weights', torch.ones(physics_features) if physics_features > 0 else None)
         
-        # Scalar feature processing (R-value, GWPIL, etc.)
-        if n_scalar_features > 0:
-            self.scalar_proj = nn.Sequential(
-                nn.Linear(n_scalar_features, hidden // 4),
-                nn.SiLU(),
-                nn.Dropout(dropout * 0.5),
-            )
-            scalar_out_dim = hidden // 4
-        else:
-            self.scalar_proj = None
-            scalar_out_dim = 0
+        # Scalar feature output dimension (computed before dropout type selection)
+        scalar_out_dim = hidden // 4 if n_scalar_features > 0 else 0
         
         # Compute total input features for final MLP
         # With attention: pooled(4) + mean(4) + std(4) + max(4) = 16
@@ -505,20 +642,89 @@ class ClassifierHead(nn.Module):
         else:
             mlp_input = base_features * 2 + physics_features + scalar_out_dim
         
+        # Choose dropout type based on MC dropout setting
+        # FIXED: Use MCDropout consistently when mc_dropout=True
+        if mc_dropout:
+            self._dropout_rate = mc_dropout_rate
+            drop_cls = lambda p: MCDropout(mc_dropout_rate)  # Use mc_dropout_rate, not p
+        else:
+            self._dropout_rate = dropout
+            drop_cls = nn.Dropout
+        
+        # Scalar feature processing (R-value, GWPIL, etc.) with proper dropout type
+        if n_scalar_features > 0:
+            self.scalar_proj = nn.Sequential(
+                nn.Linear(n_scalar_features, hidden // 4),
+                nn.SiLU(),
+                MCDropout(mc_dropout_rate * 0.5) if mc_dropout else nn.Dropout(dropout * 0.5),
+            )
+        else:
+            self.scalar_proj = None
+        
         # Final classifier MLP with residual
         self.pre_mlp = nn.Sequential(
             nn.Linear(mlp_input, hidden),
             nn.LayerNorm(hidden),
             nn.SiLU(),
-            nn.Dropout(dropout),
+            drop_cls(dropout),
         )
         
         self.classifier = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.SiLU(),
-            nn.Dropout(dropout),
+            drop_cls(dropout),
             nn.Linear(hidden // 2, len(horizons))
         )
+        
+        # Store dropout layers for MC mode toggling
+        # FIXED: Collect from ALL submodules including scalar_proj
+        self._mc_dropout_layers: list[MCDropout] = []
+        for m in self.modules():
+            if isinstance(m, MCDropout):
+                self._mc_dropout_layers.append(m)
+    
+    def set_mc_mode(self, enabled: bool):
+        """Enable/disable Monte Carlo dropout mode for uncertainty estimation."""
+        for layer in self._mc_dropout_layers:
+            layer.set_mc_mode(enabled)
+    
+    def forward_with_uncertainty(
+        self,
+        feats: dict[str, torch.Tensor],
+        observed_mask: torch.Tensor,
+        scalars: Optional[torch.Tensor] = None,
+        n_samples: int = 10,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with MC Dropout uncertainty estimation.
+        
+        Args:
+            feats: Feature dictionary
+            observed_mask: Temporal mask
+            scalars: Scalar features
+            n_samples: Number of MC samples
+        
+        Returns:
+            mean_probs: Mean predicted probabilities
+            std_probs: Uncertainty (std of predictions)
+            logits: All sampled logits [n_samples, B, horizons]
+        """
+        self.set_mc_mode(True)
+        
+        all_logits = []
+        for _ in range(n_samples):
+            logits = self.forward(feats, observed_mask, scalars)
+            all_logits.append(logits)
+        
+        self.set_mc_mode(False)
+        
+        all_logits = torch.stack(all_logits)  # [n_samples, B, horizons]
+        all_probs = torch.sigmoid(all_logits)
+        
+        mean_probs = all_probs.mean(dim=0)
+        std_probs = all_probs.std(dim=0)
+        
+        return mean_probs, std_probs, all_logits
 
     def forward(
         self, 

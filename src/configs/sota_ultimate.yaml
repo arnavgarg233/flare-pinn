@@ -1,0 +1,128 @@
+# =============================================================================
+# SOTA ULTIMATE CONFIG - Phase 3: Maximum Performance
+# =============================================================================
+# USE AFTER sota_v2.yaml achieves TSS > 0.70!
+#
+# This config pushes for maximum TSS by:
+# 1. Larger model capacity
+# 2. Aggressive physics integration
+# 3. All regularization techniques
+# 4. Long training with careful scheduling
+#
+# Target: TSS > 0.85 at 24h horizon
+# =============================================================================
+
+seed: 42
+device: "mps"  # Change to "cuda" for NVIDIA GPUs
+
+model:
+  model_type: "hybrid"
+  hidden: 512              # Maximum hidden size
+  layers: 10               # Deep network
+  learn_eta: true
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 6       # High frequency detail
+    ramp_frac: 0.15
+
+classifier:
+  hidden: 256              # Large classifier
+  dropout: 0.2             # Lower dropout for capacity
+  horizons: [6, 12, 24]
+  
+  # Asymmetric focal loss
+  loss_type: "asymmetric"
+  focal_alpha: 0.8
+  focal_gamma: 1.0
+  asymmetric_gamma_neg: 5.0  # Very strong negative focusing
+  
+  # Full calibration
+  label_smoothing: 0.05
+  confidence_penalty: 0.03
+  
+  # All features
+  use_attention: true
+  use_physics_features: true
+  use_rf_guidance: true
+
+physics:
+  enable: true
+  resistive: true
+  boundary_terms: false
+  
+  # Aggressive physics schedule
+  lambda_phys_schedule:
+    - [0.0, 0.0]
+    - [0.1, 0.0]           # Warm-up
+    - [0.2, 1.0]           # Start physics
+    - [0.3, 2.5]
+    - [0.5, 5.0]
+    - [0.7, 10.0]
+    - [0.9, 15.0]
+    - [1.0, 20.0]          # Strong physics
+
+eta:
+  min: 1.0e-5
+  max: 3.0
+  tv_weight: 2.0e-3
+
+loss_weights:
+  cls: 4.0                 # Strong classification focus
+  data: 0.8
+  curl_consistency: 0.15
+
+collocation:
+  n_max: 16384             # Dense sampling
+  alpha_start: 0.7
+  alpha_end: 0.95          # Almost all PIL
+  impw_clip_quantile: 0.998
+
+train:
+  steps: 80000             # Very long training
+  batch_size: 1
+  lr: 1.5e-4               # Lower LR for stability
+  grad_clip: 2.0           # Tighter clipping
+  amp: false
+  log_every: 200
+  eval_every: 2000
+  checkpoint_every: 10000
+  checkpoint_dir: "outputs/checkpoints/sota_ultimate"
+  
+  scheduler:
+    type: "cosine"
+    warmup_steps: 5000
+    min_lr: 5.0e-7
+  
+  num_workers: 4           # Parallel data loading to avoid I/O bottleneck
+  
+  sampler:
+    strategy: "class_balanced"
+    positive_multiplier: 80.0
+    smoothing: 0.25
+  
+  use_ema: true
+  ema_decay: 0.9997        # Very slow EMA
+
+data:
+  use_real: true
+  windows_parquet: "data/interim/windows_train.parquet"
+  frames_meta_parquet: "/Volumes/Lexar/flare_forecasting/frames_meta.parquet"
+  npz_root: "/Volumes/Lexar/flare_forecasting/frames"
+  target_size: 128         # Full resolution
+  input_hours: 48
+  P_per_t: 1024
+  pil_top_pct: 0.10
+  val_fraction: 0.10       # More training data
+  
+  scalar_features:
+    - frame_count_in_window
+    - obs_coverage
+    - horizon_coverage_6h
+    - horizon_coverage_12h
+    - horizon_coverage_24h
+
+  dummy_T: 8
+  dummy_H: 64
+  dummy_W: 64
+  dummy_num_samples: 2048
+

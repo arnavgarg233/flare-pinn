@@ -14,16 +14,16 @@ device: "mps"
 
 model:
   model_type: "hybrid"     # CNN encoder + coordinate MLP
-  hidden: 384              # Reduced from 512 for memory
-  layers: 10               # Reduced from 12 for memory
+  hidden: 256              # Reduced for 16GB MPS
+  layers: 6                # Reduced for 16GB MPS
   learn_eta: true          # Learn spatially-varying resistivity
   eta_scalar: 0.01
   fourier:
-    max_log2_freq: 6       # Reduced from 7 for memory
+    max_log2_freq: 5       # Reduced for memory
     ramp_frac: 0.15        # Faster Fourier feature ramp-up
 
 classifier:
-  hidden: 256              # Reduced for memory
+  hidden: 128              # Reduced for memory
   dropout: 0.25            # Slightly less dropout for better learning
   horizons: [6, 12, 24]
   
@@ -51,16 +51,16 @@ physics:
   resistive: true
   boundary_terms: false
   
-  # SOTA: Very aggressive physics curriculum
-  # Start physics early and ramp up strongly
+  # FIXED: Physics starts at ZERO to prevent NaN!
+  # Gradual introduction for stability
   lambda_phys_schedule:
-    - [0.0, 0.5]           # Start with some physics immediately
-    - [0.1, 1.5]           # Ramp up quickly
-    - [0.2, 3.0]
-    - [0.4, 6.0]
-    - [0.6, 10.0]
-    - [0.8, 15.0]
-    - [1.0, 20.0]          # Strong physics at end
+    - [0.0, 0.0]           # NO physics at start (prevents NaN!)
+    - [0.15, 0.0]          # Still zero during warm-up
+    - [0.25, 0.5]          # Start introducing physics
+    - [0.4, 1.5]           # Moderate physics
+    - [0.6, 3.0]           # Stronger
+    - [0.8, 5.0]           # Strong
+    - [1.0, 8.0]           # Maximum (reasonable limit)
 
 eta:
   min: 1.0e-5
@@ -73,18 +73,18 @@ loss_weights:
   curl_consistency: 0.1    # Increased curl consistency
 
 collocation:
-  n_max: 16384             # Reduced from 24576 for memory
+  n_max: 8192              # Reduced for 16GB MPS
   alpha_start: 0.7         # More PIL focus from start
   alpha_end: 0.95          # Strong PIL focus at end
   impw_clip_quantile: 0.995
 
 train:
-  steps: 50000
+  steps: 20000
   batch_size: 1            # Must be 1 for PINN
   lr: 2.5e-4               # Slightly lower LR for stability
-  grad_clip: 0.5
+  grad_clip: 3.0           # FIXED: Higher clipping (was 0.5, too aggressive)
   amp: false               # CRITICAL: Disable for MPS
-  log_every: 100
+  log_every: 10
   eval_every: 2000
   checkpoint_every: 5000
   checkpoint_dir: "outputs/checkpoints/mps_optimized"
@@ -94,10 +94,12 @@ train:
     warmup_steps: 3000     # Longer warmup for stability
     min_lr: 1.0e-6
   
+  num_workers: 4           # Parallel data loading to avoid I/O bottleneck
+  
   sampler:
     strategy: "class_balanced"
-    positive_multiplier: 150.0   # SOTA: Very aggressive oversampling
-    smoothing: 0.2               # Some smoothing on weights
+    positive_multiplier: 30.0    # FIXED: More moderate (was 150, too aggressive)
+    smoothing: 0.4               # More smoothing on weights
   
   use_ema: true
   ema_decay: 0.9995             # Strong EMA for better generalization
@@ -106,10 +108,10 @@ data:
   use_real: true
   windows_parquet: "data/interim/windows_train.parquet"
   frames_meta_parquet: "/Volumes/Lexar/flare_forecasting/frames_meta.parquet"
-  npz_root: "/Volumes/Lexar/flare_forecasting"
-  target_size: 128         # Keep at 128 for MPS memory
+  npz_root: "/Volumes/Lexar/flare_forecasting/frames"
+  target_size: 96          # Reduced for 16GB MPS
   input_hours: 48
-  P_per_t: 2048            # Reduced from 3072 for memory
+  P_per_t: 1024            # Reduced for 16GB MPS
   pil_top_pct: 0.10        # Slightly tighter PIL threshold
   val_fraction: 0.12
   

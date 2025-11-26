@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+wh#!/usr/bin/env python3
 """
 download_sharp_cea.py — only download missing, resume-safe, fast
 

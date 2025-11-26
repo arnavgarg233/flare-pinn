@@ -28,11 +28,23 @@ def tss_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> floa
     tpr, fpr = tpr_fpr(tp, fp, fn, tn)
     return float(tpr - fpr)
 
-def sweep_tss(y_true: np.ndarray, y_prob: np.ndarray, n: int = 512) -> Tuple[float, float]:
-    if len(y_prob) <= n:
-        thrs = np.unique(np.sort(y_prob))
+def sweep_tss(y_true: np.ndarray, y_prob: np.ndarray, n: int = 1024) -> Tuple[float, float]:
+    """
+    Find optimal TSS threshold via exhaustive search.
+    
+    Uses unique probability values when dataset is small enough,
+    otherwise uses linspace + unique probability values for better coverage.
+    """
+    # Always include unique probability values for better precision
+    unique_probs = np.unique(y_prob)
+    
+    if len(unique_probs) <= n:
+        thrs = unique_probs
     else:
-        thrs = np.linspace(0, 1, n)
+        # Combine linspace with sampled unique probabilities
+        linspace_thrs = np.linspace(0, 1, n // 2)
+        sampled_unique = np.random.choice(unique_probs, size=min(n // 2, len(unique_probs)), replace=False)
+        thrs = np.unique(np.concatenate([linspace_thrs, sampled_unique]))
     best = -1.0
     best_thr = 0.5
     for thr in thrs:

@@ -1,0 +1,146 @@
+# SOTA Configuration for 16GB Apple Silicon (MPS)
+# ================================================
+# 
+# Optimized for:
+# - Apple M1/M2/M3 with 16GB unified RAM
+# - Batch size 1 with gradient accumulation
+# - Memory-efficient encoder (GRU-based)
+# - Aggressive checkpointing
+#
+# Expected metrics: TSS > 0.75, PR-AUC > 0.45
+# Training time: ~8-12 hours for 30k steps
+
+seed: 42
+device: mps
+
+model:
+  model_type: hybrid
+  in_channels: 1
+  hidden: 256          # Reduced from 384 for memory
+  layers: 8            # Reduced from 10
+  learn_eta: false
+  eta_scalar: 0.01
+  vector_B: false      # Keep scalar for memory efficiency
+  
+  fourier:
+    max_log2_freq: 4   # Reduced from 5
+    ramp_frac: 0.3     # Faster ramp-up
+  
+  encoder:
+    type: gru          # Memory-efficient GRU instead of Transformer
+    latent_channels: 24  # Reduced from 32
+    global_dim: 48      # Reduced from 64
+    n_heads: 2          # Not used for GRU
+    dropout: 0.1
+    use_checkpoint: true  # Critical for memory
+
+classifier:
+  hidden: 192          # Reduced from 256
+  dropout: 0.15
+  horizons: [6, 12, 24]
+  loss_type: cb_focal  # Class-balanced focal for imbalance
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  cb_beta: 0.9999      # For 1:50 imbalance
+  use_attention: true
+  use_physics_features: true
+  use_rf_guidance: true  # Domain-knowledge weighting
+  label_smoothing: 0.05  # Prevents overconfidence
+  confidence_penalty: 0.05
+  
+  # Uncertainty quantification
+  mc_dropout: true
+  mc_samples: 5        # Reduced for inference speed
+  mc_dropout_rate: 0.15
+  use_temperature_scaling: true
+
+physics:
+  enable: true
+  resistive: false     # Simpler physics for stability
+  boundary_terms: false
+  
+  # Conservative physics schedule (stability over speed)
+  lambda_phys_schedule:
+    - [0.0, 0.0]       # No physics initially
+    - [0.4, 0.0]       # Classification-only warmup
+    - [0.6, 0.5]       # Gentle physics introduction
+    - [0.8, 1.5]       # Moderate physics
+    - [1.0, 2.0]       # Final physics weight
+  
+  use_uncertainty_weighting: true
+  enforce_force_free: false  # Disable for memory
+  
+  # Curriculum settings
+  curriculum_strategy: warmup_hold
+  warmup_fraction: 0.4
+  physics_grad_scale: 0.3  # Lower interference with classification
+  max_collocation_during_warmup: 2048
+
+eta:
+  min: 0.0001
+  max: 1.0
+  tv_weight: 0.001
+
+loss_weights:
+  cls: 1.0
+  data: 0.5           # Lower than classification
+  curl_consistency: 0.0  # Disabled for memory
+
+collocation:
+  n_max: 6144         # Reduced for memory (was 20000)
+  alpha_start: 0.6    # Higher PIL focus from start
+  alpha_end: 0.85
+  impw_clip_quantile: 0.98
+
+train:
+  steps: 30000        # Reduced for faster iteration
+  batch_size: 1       # MPS limit
+  num_workers: 0      # MPS doesn't support multiprocessing well
+  lr: 0.0008          # Slightly lower for stability
+  grad_clip: 0.5      # Tighter clipping
+  amp: true           # Essential for 16GB
+  log_every: 50
+  eval_every: 500
+  checkpoint_every: 2500
+  checkpoint_dir: outputs/checkpoints/sota_mps
+  
+  scheduler:
+    type: cosine
+    warmup_steps: 2000
+    min_lr: 0.00001
+  
+  sampler:
+    strategy: class_balanced
+    positive_multiplier: 25.0  # Aggressive oversampling
+    smoothing: 0.3
+  
+  use_ema: true
+  ema_decay: 0.9995
+  
+  # Memory optimization (CRITICAL)
+  gradient_accumulation_steps: 8  # Effective batch = 8
+  memory_cleanup_every: 25
+  use_gradient_checkpointing: true
+  max_collocation_points: 4096
+
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: data/processed/consolidated_harps
+  windows_parquet: data/interim/windows_train.parquet
+  target_size: 96     # Reduced from 128 for memory
+  input_hours: 36     # Reduced from 48 for memory
+  P_per_t: 512        # Reduced from 1024
+  pil_top_pct: 0.12
+  val_fraction: 0.15
+  components: [Bz]
+  
+  # SOTA feature engineering
+  use_previous_flare_activity: true
+  use_pil_evolution: true
+  use_temporal_statistics: true
+  use_goes_xray: false  # Not available
+  
+  # Memory-efficient multi-scale
+  multi_scale_crops: false  # Disable for memory
+

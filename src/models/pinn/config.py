@@ -4,8 +4,11 @@ Pydantic configuration models for PINN training.
 Provides type-safe, validated configuration management.
 """
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Literal, Optional
+
+import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -22,14 +25,41 @@ class FourierConfig(BaseModel):
         return v
 
 
+class EncoderConfig(BaseModel):
+    """CNN/Temporal encoder configuration."""
+    type: Literal["tiny", "temporal", "transformer", "multiscale", "lightweight", "gru"] = Field(
+        default="temporal",
+        description="Encoder type: tiny (simple), temporal (attention), transformer (SOTA), multiscale (FPN), lightweight (MobileNet-style), gru (memory-efficient)"
+    )
+    latent_channels: int = Field(default=32, ge=16, le=128)
+    global_dim: int = Field(default=64, ge=32, le=256)
+    n_transformer_layers: int = Field(default=3, ge=1, le=6, description="Transformer encoder layers (for transformer type)")
+    n_heads: int = Field(default=4, ge=1, le=8, description="Attention heads")
+    dropout: float = Field(default=0.1, ge=0.0, le=0.5)
+    use_checkpoint: bool = Field(default=True, description="Use gradient checkpointing to reduce memory")
+
+
 class ModelConfig(BaseModel):
     """PINN backbone configuration."""
+    model_config = {"protected_namespaces": ()}
+    
     model_type: Literal["mlp", "hybrid"] = Field(default="mlp", description="Model architecture: 'mlp' (pure coordinate) or 'hybrid' (CNN+MLP)")
+    # in_channels is now typically derived from data.components, but kept here for manual override/back-compat
+    in_channels: Optional[int] = Field(default=None, description="Input channels (1=Bz, 3=Bx,By,Bz). If None, derived from data config.")
     hidden: int = Field(default=384, ge=64, le=2048, description="Hidden dimension for MLP")
     layers: int = Field(default=10, ge=2, le=20, description="Number of hidden layers")
     learn_eta: bool = Field(default=False, description="Learn spatially-varying resistivity η(x,y,t)")
     eta_scalar: float = Field(default=0.01, ge=1e-6, le=1.0, description="Fixed scalar resistivity if not learning")
     fourier: FourierConfig = Field(default_factory=FourierConfig)
+    vector_B: bool = Field(
+        default=False, 
+        description="Enable 3-component B field (Bx, By, Bz) with full vector induction physics"
+    )
+    hard_div_free: bool = Field(
+        default=False,
+        description="Enforce div B = 0 by defining B = curl A (requires vector_B=True)"
+    )
+    encoder: EncoderConfig = Field(default_factory=EncoderConfig)
 
 
 class ClassifierConfig(BaseModel):
@@ -37,11 +67,16 @@ class ClassifierConfig(BaseModel):
     hidden: int = Field(default=256, ge=64, le=1024)
     dropout: float = Field(default=0.1, ge=0.0, le=0.9)
     horizons: tuple[int, ...] = Field(default=(6, 12, 24), description="Prediction horizons in hours")
-    loss_type: Literal["bce", "focal", "asymmetric"] = Field(default="focal")
+    loss_type: Literal["bce", "focal", "asymmetric", "cb_focal", "poly_focal"] = Field(
+        default="cb_focal",  # SOTA: class-balanced focal for severe imbalance
+        description="Loss function: bce, focal, asymmetric, cb_focal (class-balanced), poly_focal"
+    )
     focal_alpha: float = Field(default=0.25, ge=0.0, le=1.0, description="Focal loss alpha (weight for positive class)")
     focal_gamma: float = Field(default=2.0, ge=0.0, le=5.0, description="Focal loss gamma (focusing parameter)")
     asymmetric_gamma_neg: float = Field(default=4.0, ge=0.0, le=8.0, description="Asymmetric focal loss gamma for negatives")
     pos_weight: Optional[float] = Field(default=None, ge=1.0, description="Positive class weight for BCE")
+    cb_beta: float = Field(default=0.9999, ge=0.9, le=0.99999, description="Class-balanced loss beta (higher = more weighting)")
+    poly_epsilon: float = Field(default=1.0, ge=0.0, le=5.0, description="PolyLoss epsilon coefficient")
     use_rf_guidance: bool = Field(default=False, description="Use Random Forest feature importance weighting")
     rf_weights_path: Optional[Path] = Field(default=None, description="Path to pre-computed RF importance weights pickle")
     use_attention: bool = Field(default=True, description="Use spatial and temporal attention in classifier")
@@ -50,6 +85,32 @@ class ClassifierConfig(BaseModel):
     confidence_penalty: float = Field(default=0.0, ge=0.0, le=1.0, description="Weight for confidence/entropy regularization")
     gradient_penalty: float = Field(default=0.0, ge=0.0, le=1.0, description="Weight for gradient penalty (Lipschitz regularization)")
     mixup_alpha: float = Field(default=0.0, ge=0.0, le=1.0, description="Mixup augmentation alpha (0 = disabled)")
+    
+    # SOTA: Uncertainty quantification
+    mc_dropout: bool = Field(
+        default=False,
+        description="Enable Monte Carlo Dropout for uncertainty quantification during inference"
+    )
+    mc_samples: int = Field(
+        default=10, ge=3, le=50,
+        description="Number of MC dropout samples for uncertainty estimation"
+    )
+    mc_dropout_rate: float = Field(
+        default=0.2, ge=0.1, le=0.5,
+        description="Dropout rate for MC Dropout (can be different from training dropout)"
+    )
+    
+    # SOTA: Calibration
+    use_temperature_scaling: bool = Field(
+        default=True,
+        description="Apply temperature scaling for probability calibration (post-training)"
+    )
+    
+    # Distribution shift handling
+    use_domain_adaptation: bool = Field(
+        default=False,
+        description="Enable domain adaptation layers for solar cycle shift (cycle 24 -> 25)"
+    )
     
     @field_validator('rf_weights_path', mode='before')
     @classmethod
@@ -69,6 +130,81 @@ class PhysicsConfig(BaseModel):
         description="Piecewise-linear schedule [[frac, weight], ...] for physics loss ramp-up"
     )
     
+    # Vector physics options (only used when model.vector_B=True)
+    div_B_weight: float = Field(
+        default=1.0, 
+        ge=0.0, 
+        le=10.0,
+        description="Weight for solenoidal constraint ∇·B=0 (vector mode only)"
+    )
+    enforce_div_free_u: bool = Field(
+        default=False,
+        description="Enforce divergence-free velocity (incompressible flow constraint)"
+    )
+    component_weights: tuple[float, float, float] = Field(
+        default=(1.0, 1.0, 1.0),
+        description="Weights for (Bx, By, Bz) component losses (vector mode only)"
+    )
+    
+    # SOTA: Advanced physics options
+    use_uncertainty_weighting: bool = Field(
+        default=True,
+        description="Use learned uncertainty weighting for automatic loss balancing (Kendall et al. 2018)"
+    )
+    enforce_force_free: bool = Field(
+        default=False,
+        description="Add force-free constraint (J × B ≈ 0) for low-β corona"
+    )
+    force_free_weight: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Weight for force-free constraint"
+    )
+
+    # SOTA: Causal Training (Wang et al., 2022)
+    # Respects temporal causality in PDE solving
+    use_causal_weighting: bool = Field(
+        default=False,
+        description="Enable causal weighting to enforce time-directionality in physics loss"
+    )
+    causal_tol: float = Field(
+        default=1.0,
+        description="Tolerance parameter for causal weighting"
+    )
+    
+    # Gradient stability
+    enable_gradient_clamping: bool = Field(
+        default=True,
+        description="Enable soft clamping of spatial gradients (prevents explosion)"
+    )
+    gradient_clamp_value: float = Field(
+        default=100.0,
+        description="Max value for gradient clamping"
+    )
+    
+    # SOTA: Curriculum learning for physics
+    curriculum_strategy: Literal["linear", "exponential", "adaptive", "warmup_hold"] = Field(
+        default="warmup_hold",
+        description="Physics loss curriculum strategy: linear (gradual), exponential (accelerating), adaptive (loss-based), warmup_hold (delay then constant)"
+    )
+    warmup_fraction: float = Field(
+        default=0.3, ge=0.0, le=0.8,
+        description="Fraction of training to delay/warmup physics loss"
+    )
+    
+    # Gradient scaling for physics loss (prevents dominating classification)
+    physics_grad_scale: float = Field(
+        default=0.5, ge=0.1, le=2.0,
+        description="Scale factor for physics gradients (lower = less interference with classification)"
+    )
+    
+    # Collocation point reduction for memory
+    max_collocation_during_warmup: int = Field(
+        default=4096, ge=512, le=16384,
+        description="Reduced collocation points during physics warmup (memory optimization)"
+    )
+    
     @field_validator('lambda_phys_schedule')
     @classmethod
     def validate_schedule(cls, v: list[list[float]]) -> list[list[float]]:
@@ -80,6 +216,13 @@ class PhysicsConfig(BaseModel):
             if not (0.0 <= point[0] <= 1.0):
                 raise ValueError(f"Schedule fraction must be in [0,1], got {point[0]}")
         return sorted(v, key=lambda p: p[0])
+    
+    @field_validator('component_weights', mode='before')
+    @classmethod
+    def validate_component_weights(cls, v):
+        if isinstance(v, list):
+            return tuple(v)
+        return v
 
 
 class EtaConfig(BaseModel):
@@ -134,6 +277,7 @@ class TrainConfig(BaseModel):
     """Training hyperparameters."""
     steps: int = Field(default=50000, ge=100, le=1000000)
     batch_size: int = Field(default=1, ge=1, le=64)
+    num_workers: int = Field(default=0, ge=0, le=32, description="Number of DataLoader workers")
     lr: float = Field(default=1e-3, ge=1e-6, le=1e-1)
     grad_clip: float = Field(default=1.0, ge=0.0, le=10.0)
     amp: bool = Field(default=True, description="Automatic mixed precision")
@@ -146,6 +290,28 @@ class TrainConfig(BaseModel):
     use_ema: bool = Field(default=True, description="Use Exponential Moving Average for model weights")
     ema_decay: float = Field(default=0.999, ge=0.9, le=0.9999, description="EMA decay rate")
     
+    # Memory optimization settings (critical for 16GB MPS)
+    gradient_accumulation_steps: int = Field(
+        default=4, ge=1, le=32,
+        description="Gradient accumulation steps (effective batch = batch_size * accum_steps)"
+    )
+    memory_cleanup_every: int = Field(
+        default=50, ge=10, le=1000,
+        description="Clear memory cache every N steps (MPS optimization)"
+    )
+    use_gradient_checkpointing: bool = Field(
+        default=True,
+        description="Use gradient checkpointing to trade compute for memory"
+    )
+    max_collocation_points: int = Field(
+        default=8192, ge=1024, le=65536,
+        description="Max collocation points per sample (reduce for memory)"
+    )
+    
+    # SAM optimizer (experimental - high memory cost)
+    use_sam: bool = Field(default=False, description="Use Sharpness-Aware Minimization (doubles memory)")
+    sam_rho: float = Field(default=0.05, ge=0.01, le=0.5, description="SAM perturbation radius")
+    
     @field_validator('checkpoint_dir', mode='before')
     @classmethod
     def validate_checkpoint_dir(cls, v):
@@ -157,15 +323,68 @@ class TrainConfig(BaseModel):
 class DataConfig(BaseModel):
     """Dataset configuration."""
     use_real: bool = Field(default=False, description="Use real SHARP data (True) or dummy data (False)")
+    use_consolidated: bool = Field(default=False, description="Use consolidated per-HARP dataset for faster I/O")
+    consolidated_dir: Optional[Path] = Field(default=None, description="Path to consolidated HARP bundles")
     windows_parquet: Optional[Path] = None
     frames_meta_parquet: Optional[Path] = None
     npz_root: Optional[Path] = None
-    target_size: int = Field(default=256, ge=64, le=1024, description="Spatial resolution (pixels)")
+    target_size: int = Field(default=128, ge=64, le=1024, description="Spatial resolution (pixels)")
     input_hours: int = Field(default=48, ge=6, le=120, description="Input time window (hours)")
     P_per_t: int = Field(default=1024, ge=256, le=8192, description="Points sampled per time slice")
     pil_top_pct: float = Field(default=0.15, ge=0.01, le=0.5, description="Top % of |∇Bz| for PIL mask")
     val_fraction: float = Field(default=0.15, ge=0.05, le=0.3, description="Validation set fraction")
-    scalar_features: list[str] = Field(default_factory=list, description="Additional scalar features to use")
+    components: list[str] = Field(
+        default_factory=lambda: ["Bz"],
+        description="List of field components to load (e.g., ['Bz'] or ['Bx', 'By', 'Bz'])"
+    )
+    scalar_features: list[str] = Field(
+        default_factory=lambda: ["r_value", "gwpil", "obs_coverage", "frame_count"],
+        description="Scalar features to use (computed from data). Default: R-value, GWPIL, observation coverage, frame count"
+    )
+    
+    # SOTA: Additional feature engineering
+    use_previous_flare_activity: bool = Field(
+        default=True,
+        description="Include previous flare activity (24h, 48h, 72h lookback) as features"
+    )
+    use_pil_evolution: bool = Field(
+        default=True,
+        description="Compute PIL evolution features (growth, motion, intensity)"
+    )
+    use_temporal_statistics: bool = Field(
+        default=True,
+        description="Compute temporal statistics of R-value, GWPIL (trend, acceleration)"
+    )
+    use_goes_xray: bool = Field(
+        default=False,
+        description="Include GOES X-ray flux history as auxiliary input (requires additional data)"
+    )
+    
+    # Multi-scale features (memory-efficient)
+    multi_scale_crops: bool = Field(
+        default=False,
+        description="Use multi-scale spatial crops (2x, 4x zoom on PIL region)"
+    )
+    multi_scale_memory_efficient: bool = Field(
+        default=True,
+        description="Process multi-scale crops sequentially to reduce memory"
+    )
+    
+    @property
+    def n_components(self) -> int:
+        return len(self.components)
+    
+    @property
+    def n_scalar_features(self) -> int:
+        """Compute total number of scalar features including derived ones."""
+        n = len(self.scalar_features)
+        if self.use_previous_flare_activity:
+            n += 6  # flare_24h, flare_48h, flare_72h (C, M, X class counts)
+        if self.use_pil_evolution:
+            n += 8  # PIL evolution features
+        if self.use_temporal_statistics:
+            n += 4  # R-value trend, GWPIL trend, etc.
+        return n
     
     # Dummy data settings
     dummy_T: int = Field(default=8, ge=2, le=48, description="Dummy time steps")
@@ -178,13 +397,17 @@ class DataConfig(BaseModel):
         if self.use_real:
             if self.windows_parquet is None:
                 raise ValueError("windows_parquet is required when use_real=True")
-            if self.frames_meta_parquet is None:
-                raise ValueError("frames_meta_parquet is required when use_real=True")
-            if self.npz_root is None:
-                raise ValueError("npz_root is required when use_real=True")
+            if self.use_consolidated:
+                if self.consolidated_dir is None:
+                    raise ValueError("consolidated_dir is required when use_consolidated=True")
+            else:
+                if self.frames_meta_parquet is None:
+                    raise ValueError("frames_meta_parquet is required when use_real=True and not using consolidated")
+                if self.npz_root is None:
+                    raise ValueError("npz_root is required when use_real=True and not using consolidated")
         return self
     
-    @field_validator('windows_parquet', 'frames_meta_parquet', 'npz_root', mode='before')
+    @field_validator('windows_parquet', 'frames_meta_parquet', 'npz_root', 'consolidated_dir', mode='before')
     @classmethod
     def validate_paths(cls, v):
         if v is not None:
@@ -209,14 +432,12 @@ class PINNConfig(BaseModel):
     @classmethod
     def from_yaml(cls, path: str | Path) -> PINNConfig:
         """Load configuration from YAML file."""
-        import yaml
         with open(path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
         return cls(**data)
     
     def to_yaml(self, path: str | Path) -> None:
         """Save configuration to YAML file."""
-        import yaml
         with open(path, 'w', encoding='utf-8') as f:
             yaml.safe_dump(
                 self.model_dump(mode='json', exclude_none=True),
