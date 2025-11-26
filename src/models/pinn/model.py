@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from .config import PINNConfig
 from .core import PINNBackbone, ClassifierHead, B_perp_from_Az
-from .physics import WeakFormInduction2p5D
+from .physics import WeakFormInduction2p5D, VectorInduction2p5D, VectorPhysicsResidualInfo
 from .losses import focal_loss, bce_logits, l1_data, curl_consistency_l1, interp_schedule
 from .collocation import mix_pil_uniform, clip_and_renorm_importance
 
@@ -37,16 +37,23 @@ class PINNOutput:
     B_x: Optional[torch.Tensor]       # [N, 1] in-plane field (if computed)
     B_y: Optional[torch.Tensor]       # [N, 1] in-plane field (if computed)
     
+    # Packed vector fields (for vector mode)
+    B: Optional[torch.Tensor] = None  # [N, 3] full B vector (Bx, By, Bz)
+    u: Optional[torch.Tensor] = None  # [N, 2] velocity vector (ux, uy)
+    
     # Losses
-    loss_cls: torch.Tensor            # Classification loss
-    loss_data: torch.Tensor           # Data fitting loss (L1 on Bz)
-    loss_phys: torch.Tensor           # Physics residual loss
-    loss_total: torch.Tensor          # Weighted total
+    loss_cls: torch.Tensor = None     # Classification loss
+    loss_data: torch.Tensor = None    # Data fitting loss (L1 on Bz)
+    loss_phys: torch.Tensor = None    # Physics residual loss
+    loss_total: torch.Tensor = None   # Weighted total
     
     # Diagnostics
-    ess: float                        # Effective sample size (collocation quality)
-    lambda_phys: float                # Current physics weight
-    fourier_alpha: float              # Current Fourier frequency weight
+    ess: float = 0.0                  # Effective sample size (collocation quality)
+    lambda_phys: float = 0.0          # Current physics weight
+    fourier_alpha: float = 1.0        # Current Fourier frequency weight
+    
+    # Physics diagnostics (for vector mode)
+    physics_info: Optional[VectorPhysicsResidualInfo] = None
 
 
 class PINNModel(nn.Module):
@@ -54,39 +61,78 @@ class PINNModel(nn.Module):
     Complete PINN system for solar flare prediction.
     
     Architecture:
-      1. Coordinate MLP backbone (x,y,t) -> (A_z, B_z, u_x, u_y, [η])
+      1. Coordinate MLP backbone (x,y,t) -> (A_z, B, u) where B can be scalar or vector
       2. Classifier head: pooled features -> multi-horizon logits
       3. Physics loss: weak-form 2.5D induction equation on collocation points
       
     Training stages (curriculum):
       P0: Data-driven only (λ_phys=0)
       P1-P4: Gradual physics ramp-up via lambda_phys_schedule
+      
+    Vector Mode (new):
+      When cfg.model.vector_B=True, uses full 3-component B field physics:
+        - ∂Bx/∂t = ∂y(ux·By - uy·Bx) - ∂y[η·Jz]
+        - ∂By/∂t = -∂x(ux·By - uy·Bx) + ∂x[η·Jz]
+        - ∂Bz/∂t = -∇⊥·(Bz·u) + ∇⊥·(η·∇⊥Bz)
+      Plus solenoidal constraint: ∂x·Bx + ∂y·By = 0
     """
     
     def __init__(self, cfg: PINNConfig):
         super().__init__()
         self.cfg = cfg
         
+        # Check if vector B mode is enabled
+        vector_B = getattr(cfg.model, 'vector_B', False)
+        self.vector_B = vector_B
+        
         # Core components
         self.backbone = PINNBackbone(
             hidden=cfg.model.hidden,
             layers=cfg.model.layers,
             max_log2_freq=cfg.model.fourier.max_log2_freq,
-            learn_eta=cfg.model.learn_eta
+            learn_eta=cfg.model.learn_eta,
+            vector_B=vector_B,
         )
+        
+        # Scalar features count from config (default: R-value, GWPIL, obs_coverage, frame_count)
+        n_scalar_features = len(cfg.data.scalar_features) if cfg.data.scalar_features else 4
+        
+        # Read classifier config options
+        use_attention = getattr(cfg.classifier, 'use_attention', True)
+        use_physics_features = getattr(cfg.classifier, 'use_physics_features', True)
         
         self.classifier = ClassifierHead(
             hidden=cfg.classifier.hidden,
             dropout=cfg.classifier.dropout,
-            horizons=cfg.classifier.horizons
+            horizons=cfg.classifier.horizons,
+            use_attention=use_attention,
+            use_physics_features=use_physics_features,
+            n_scalar_features=n_scalar_features,
         )
         
-        self.physics = WeakFormInduction2p5D(
-            eta_bounds=(cfg.eta.min, cfg.eta.max),
-            use_resistive=cfg.physics.resistive,
-            include_boundary=cfg.physics.boundary_terms,
-            tv_eta=cfg.eta.tv_weight
-        )
+        # Physics module: use VectorInduction2p5D for vector mode
+        # Get physics config options
+        div_B_weight = getattr(cfg.physics, 'div_B_weight', 1.0)
+        component_weights = getattr(cfg.physics, 'component_weights', (1.0, 1.0, 1.0))
+        
+        if vector_B:
+            self.physics = VectorInduction2p5D(
+                eta_bounds=(cfg.eta.min, cfg.eta.max),
+                use_resistive=cfg.physics.resistive,
+                include_boundary=cfg.physics.boundary_terms,
+                tv_eta=cfg.eta.tv_weight,
+                enforce_div_free_B=True,
+                div_B_weight=div_B_weight,
+                component_weights=component_weights,
+            )
+        else:
+            # Legacy scalar physics (backward compatible via alias)
+            self.physics = WeakFormInduction2p5D(
+                eta_bounds=(cfg.eta.min, cfg.eta.max),
+                use_resistive=cfg.physics.resistive,
+                include_boundary=cfg.physics.boundary_terms,
+                tv_eta=cfg.eta.tv_weight,
+            )
         
         # Training state
         self.register_buffer("_train_frac", torch.tensor(0.0))  # progress ∈ [0,1]
@@ -125,6 +171,7 @@ class PINNModel(nn.Module):
         observed_mask: Optional[torch.Tensor] = None,  # [T] bool (which frames are observed)
         labels: Optional[torch.Tensor] = None,         # [B, n_horizons] flare labels
         pil_mask: Optional[np.ndarray] = None,         # [H, W] PIL mask for importance sampling
+        scalars: Optional[torch.Tensor] = None,        # [B, n_scalars] scalar features (R-value, GWPIL, etc.)
         mode: str = "train"                # "train" or "eval"
     ) -> PINNOutput:
         """
@@ -164,17 +211,31 @@ class PINNModel(nn.Module):
         # Forward through backbone
         out = self.backbone(coords_flat)
         A_z = out["A_z"]
-        B_z = out["B_z"]
-        u_x = out["u_x"]
-        u_y = out["u_y"]
-        eta_raw = out["eta_raw"]
+        eta_raw = out.get("eta_raw")
         
-        # Optionally compute in-plane field from vector potential
-        # Optional: compute in-plane field (requires gradients)
-        B_x, B_y = None, None
-        if self.cfg.loss_weights.curl_consistency > 0:
-            if A_z.requires_grad and coords_flat.requires_grad:
-                B_x, B_y = B_perp_from_Az(A_z, coords_flat)
+        # Handle vector vs scalar mode
+        if self.vector_B:
+            # Vector mode: B and u are packed tensors
+            B_vec = out["B"]         # [N, 3]
+            u_vec = out["u"]         # [N, 2]
+            B_x = out["B_x"]
+            B_y = out["B_y"]
+            B_z = out["B_z"]
+            u_x = out["u_x"]
+            u_y = out["u_y"]
+        else:
+            # Scalar mode (legacy)
+            B_z = out["B_z"]
+            u_x = out["u_x"]
+            u_y = out["u_y"]
+            B_vec = None
+            u_vec = None
+            B_x, B_y = None, None
+            
+            # Optionally compute in-plane field from vector potential
+            if self.cfg.loss_weights.curl_consistency > 0:
+                if A_z.requires_grad and coords_flat.requires_grad:
+                    B_x, B_y = B_perp_from_Az(A_z, coords_flat)
         
         # Reshape for classifier: flatten -> [B, T, P, 1]
         feats_dict = {
@@ -184,11 +245,20 @@ class PINNModel(nn.Module):
             "u_y": u_y.reshape(B, T, P, 1),
         }
         
+        # Add horizontal field components if available (vector mode)
+        if B_x is not None and B_y is not None:
+            feats_dict["B_x"] = B_x.reshape(B, T, P, 1)
+            feats_dict["B_y"] = B_y.reshape(B, T, P, 1)
+        
         # Classification head
         if observed_mask is None:
             observed_mask = torch.ones(T, dtype=torch.bool, device=device)
         
-        logits = self.classifier(feats_dict, observed_mask.unsqueeze(0))  # [B, n_horizons]
+        # Prepare scalars for classifier (ensure batch dimension)
+        if scalars is not None and scalars.dim() == 1:
+            scalars = scalars.unsqueeze(0)  # [n_scalars] -> [1, n_scalars]
+        
+        logits = self.classifier(feats_dict, observed_mask.unsqueeze(0), scalars=scalars)  # [B, n_horizons]
         probs = torch.sigmoid(logits)
         
         # ============ Compute Losses ============
@@ -224,6 +294,7 @@ class PINNModel(nn.Module):
         loss_phys = torch.tensor(0.0, device=device)
         ess_val = 0.0
         lambda_phys = self.get_lambda_phys()
+        phys_info = None  # Will be VectorPhysicsResidualInfo in vector mode
         
         if mode == "train" and lambda_phys > 1e-8:
             # Collocation: compute PIL-based importance weights
@@ -232,21 +303,28 @@ class PINNModel(nn.Module):
             
             # Use PIL mask if provided, otherwise uniform sampling
             if pil_mask is not None:
-                # PIL mask is [H, W] numpy array
-                # Sample spatial points biased toward PIL regions
+                # PIL mask is [H, W] tensor (may be on GPU)
+                # FIXED: Handle tensor pil_mask properly (was treating as numpy)
                 from .collocation import mix_pil_uniform
-                H, W = pil_mask.shape
+                
+                # Ensure pil_mask is a tensor on the correct device
+                if isinstance(pil_mask, np.ndarray):
+                    pil_mask_tensor = torch.from_numpy(pil_mask).to(device).float()
+                else:
+                    pil_mask_tensor = pil_mask.to(device).float()
+                
+                H, W = pil_mask_tensor.shape
                 
                 # We already have coords sampled, so compute importance weights from PIL mask
                 # Extract spatial coords (x,y) from coords_flat
                 xy_coords = coords_flat[:, :2]  # [N, 2] in [-1, 1]
                 
-                # Convert to pixel coordinates
+                # Convert to pixel coordinates (keep as tensors on device)
                 x_px = ((xy_coords[:, 0] + 1.0) * 0.5 * (W - 1)).long().clamp(0, W-1)
                 y_px = ((xy_coords[:, 1] + 1.0) * 0.5 * (H - 1)).long().clamp(0, H-1)
                 
-                # Get PIL mask values at sampled points
-                pil_values = torch.from_numpy(pil_mask[y_px.cpu().numpy(), x_px.cpu().numpy()]).to(device).float()
+                # Get PIL mask values at sampled points (tensor indexing, no numpy)
+                pil_values = pil_mask_tensor[y_px, x_px]
                 
                 # Compute mixture probability: p = alpha * p_pil + (1-alpha) * p_uniform
                 p_uniform_xy = 0.25  # uniform over [-1,1]^2 has area 4
@@ -254,7 +332,8 @@ class PINNModel(nn.Module):
                 p_uniform = p_uniform_xy * p_uniform_t  # = 0.125
                 
                 # For PIL regions: mask value indicates importance
-                pil_frac = pil_mask.sum() / (H * W) if pil_mask.sum() > 0 else 1.0
+                pil_sum = pil_mask_tensor.sum()
+                pil_frac = float(pil_sum / (H * W)) if pil_sum > 0 else 1.0
                 p_pil_xy = 1.0 / (4.0 * pil_frac) if pil_frac > 0 else p_uniform_xy
                 p_pil = p_pil_xy * p_uniform_t
                 
@@ -297,6 +376,14 @@ class PINNModel(nn.Module):
             self.cfg.loss_weights.curl_consistency * loss_curl
         )
         
+        # Convert phys_info to VectorPhysicsResidualInfo if it's the legacy type
+        vector_phys_info = None
+        if phys_info is not None and self.vector_B:
+            # In vector mode, physics returns VectorPhysicsResidualInfo directly
+            # via the parent class, but wrapped in legacy PhysicsResidualInfo
+            # The actual VectorPhysicsResidualInfo is available in vector mode
+            vector_phys_info = phys_info if isinstance(phys_info, VectorPhysicsResidualInfo) else None
+        
         return PINNOutput(
             logits=logits,
             probs=probs,
@@ -306,13 +393,16 @@ class PINNModel(nn.Module):
             u_y=u_y,
             B_x=B_x,
             B_y=B_y,
+            B=B_vec if self.vector_B else None,
+            u=u_vec if self.vector_B else None,
             loss_cls=loss_cls,
             loss_data=loss_data,
             loss_phys=loss_phys,
             loss_total=loss_total,
             ess=ess_val,
             lambda_phys=lambda_phys,
-            fourier_alpha=self.backbone.ff._alpha.item()
+            fourier_alpha=self.backbone.ff._alpha.item(),
+            physics_info=vector_phys_info,
         )
     
     @torch.no_grad()
@@ -320,7 +410,7 @@ class PINNModel(nn.Module):
         self,
         coords: torch.Tensor,
         observed_mask: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict]:
         """
         Inference-only forward pass.
         
@@ -342,6 +432,12 @@ class PINNModel(nn.Module):
             "B_x": out.B_x,
             "B_y": out.B_y,
         }
+        
+        # Include packed vectors if in vector mode
+        if self.vector_B:
+            fields["B"] = out.B
+            fields["u"] = out.u
+        
         return out.probs, fields
 
 

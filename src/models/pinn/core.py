@@ -50,33 +50,115 @@ def _mlp(in_dim: int, hidden: int, out_dim: int, layers: int) -> nn.Sequential:
     mods += [nn.Linear(d, out_dim)]
     return nn.Sequential(*mods)
 
+
 class PINNBackbone(nn.Module):
     """
     Coordinate MLP with Fourier features.
-    Outputs: A_z, B_z, u_x, u_y, (optional eta_raw in R)
+    
+    Supports two output modes:
+    - Scalar mode (legacy): outputs A_z, B_z, u_x, u_y, [eta_raw]
+    - Vector mode: outputs A_z, B (3-component), u (2-component), [eta_raw]
+    
+    Vector mode enables full 2.5D vector induction equation physics.
     """
-    def __init__(self, hidden: int = 384, layers: int = 10,
-                 max_log2_freq: int = 5, learn_eta: bool = False):
+    def __init__(
+        self, 
+        hidden: int = 384, 
+        layers: int = 10,
+        max_log2_freq: int = 5, 
+        learn_eta: bool = False,
+        vector_B: bool = False,
+    ):
+        """
+        Args:
+            hidden: Hidden dimension for MLP
+            layers: Number of hidden layers
+            max_log2_freq: Maximum Fourier frequency (log2)
+            learn_eta: Learn spatially-varying resistivity
+            vector_B: Output 3-component B field (Bx, By, Bz) instead of just Bz
+        """
         super().__init__()
         self.ff = FourierFeatures(3, max_log2_freq)
         in_dim = fourier_out_dim(3, max_log2_freq)
-        out_dim = 5 if learn_eta else 4  # Az, Bz, ux, uy, [eta_raw]
-        self.net = _mlp(in_dim, hidden, out_dim, layers)
+        
+        self.vector_B = vector_B
         self.learn_eta = learn_eta
+        
+        # Compute output dimension:
+        # - A_z: 1
+        # - B: 3 (vector) or 1 (scalar)
+        # - u: 2
+        # - eta_raw: 1 (optional)
+        if vector_B:
+            # Vector mode: Az(1) + B(3) + u(2) + [eta(1)] = 6 or 7
+            out_dim = 6 + (1 if learn_eta else 0)
+        else:
+            # Scalar mode: Az(1) + Bz(1) + ux(1) + uy(1) + [eta(1)] = 4 or 5
+            out_dim = 4 + (1 if learn_eta else 0)
+        
+        self.net = _mlp(in_dim, hidden, out_dim, layers)
 
     def set_fourier_alpha(self, a: float) -> None:
         self.ff.set_alpha(a)
 
     def forward(self, coords: torch.Tensor) -> dict[str, Optional[torch.Tensor]]:
-        # coords: [N,3] with requires_grad=True for autograd derivatives
+        """
+        Forward pass.
+        
+        Args:
+            coords: [N, 3] coordinates with requires_grad=True for autograd derivatives
+            
+        Returns:
+            Dictionary with fields:
+            - Vector mode: {"A_z", "B", "u", "eta_raw", "B_x", "B_y", "B_z", "u_x", "u_y"}
+            - Scalar mode: {"A_z", "B_z", "u_x", "u_y", "eta_raw"}
+            
+            Vector mode provides both packed vectors (B, u) and unpacked components
+            for backward compatibility.
+        """
         h = self.ff(coords)
         out = self.net(h)
-        if self.learn_eta:
-            A_z, B_z, u_x, u_y, eta_raw = torch.split(out, 1, dim=-1)
+        
+        if self.vector_B:
+            # Vector mode: unpack A_z(1), B(3), u(2), [eta(1)]
+            if self.learn_eta:
+                A_z, Bx, By, Bz, ux, uy, eta_raw = torch.split(out, 1, dim=-1)
+            else:
+                A_z, Bx, By, Bz, ux, uy = torch.split(out, 1, dim=-1)
+                eta_raw = None
+            
+            # Pack into vectors for new physics module
+            B = torch.cat([Bx, By, Bz], dim=-1)  # [N, 3]
+            u = torch.cat([ux, uy], dim=-1)      # [N, 2]
+            
+            return {
+                # New vector format
+                "A_z": A_z,
+                "B": B,           # [N, 3] packed vector
+                "u": u,           # [N, 2] packed vector
+                "eta_raw": eta_raw,
+                # Legacy unpacked format (for backward compatibility)
+                "B_x": Bx,
+                "B_y": By,
+                "B_z": Bz,
+                "u_x": ux,
+                "u_y": uy,
+            }
         else:
-            A_z, B_z, u_x, u_y = torch.split(out, 1, dim=-1)
-            eta_raw = None
-        return {"A_z": A_z, "B_z": B_z, "u_x": u_x, "u_y": u_y, "eta_raw": eta_raw}
+            # Scalar mode (legacy): unpack A_z(1), B_z(1), ux(1), uy(1), [eta(1)]
+            if self.learn_eta:
+                A_z, B_z, u_x, u_y, eta_raw = torch.split(out, 1, dim=-1)
+            else:
+                A_z, B_z, u_x, u_y = torch.split(out, 1, dim=-1)
+                eta_raw = None
+            
+            return {
+                "A_z": A_z, 
+                "B_z": B_z, 
+                "u_x": u_x, 
+                "u_y": u_y, 
+                "eta_raw": eta_raw
+            }
 
 # ---------------- Helpers (hard in-plane solenoidality) ---------------- #
 
@@ -199,8 +281,14 @@ class PhysicsFeatureExtractor(nn.Module):
     - Added robust statistics (median, IQR) for outlier resistance
     - Added higher-order temporal features (acceleration)
     - Added field-flow correlation features
+    - Added current helicity proxy (critical for flare prediction)
+    - Added magnetic complexity measure
+    
+    Output: 18 physics features (up from 13)
     """
-    def __init__(self, use_extended_features: bool = False):
+    N_FEATURES = 18  # Total number of output features
+    
+    def __init__(self, use_extended_features: bool = True):
         super().__init__()
         self.use_extended = use_extended_features
         
@@ -219,58 +307,133 @@ class PhysicsFeatureExtractor(nn.Module):
         A_z = feats["A_z"]
         
         B, T, P, _ = B_z.shape
-        mask = observed_mask[..., None, None].float()  # [B, T, 1, 1]
+        mask_float = observed_mask[..., None, None].float()  # [B, T, 1, 1]
+        mask_bool = mask_float.bool()
         
         # 1. Field magnitude statistics
-        B_z_masked = B_z * mask
-        valid_count = (mask.sum(dim=(1, 2, 3)) + 1e-8)
+        # FIXED: Use where() to avoid 0*Inf=NaN
+        B_z_masked = torch.where(mask_bool, B_z, torch.zeros_like(B_z))
+        # FIXED: valid_count must account for spatial points P to avoid scaling issues
+        valid_count = (mask_float.sum(dim=(1, 2, 3)) * P + 1e-8)
         
-        # Mean and std
+        # Mean
         bz_mean = B_z_masked.sum(dim=(1, 2, 3)) / valid_count
-        bz_var = (B_z_masked ** 2).sum(dim=(1, 2, 3)) / valid_count - bz_mean ** 2
-        bz_std = bz_var.clamp(min=1e-8).sqrt()  # Clamp before sqrt for stability
+        
+        # Stable variance: E[(X - mean)^2]
+        bz_centered = torch.where(mask_bool, B_z - bz_mean.view(B, 1, 1, 1), torch.zeros_like(B_z))
+        bz_var = (bz_centered ** 2).sum(dim=(1, 2, 3)) / valid_count
+        bz_std = bz_var.clamp(min=1e-8).sqrt()
         
         # Max (absolute)
-        bz_abs_masked = B_z.abs() * mask
+        # Use where to set masked values to -inf for max
+        bz_abs_masked = torch.where(mask_bool, B_z.abs(), torch.tensor(-1e9, device=B_z.device))
         bz_max = bz_abs_masked.reshape(B, -1).max(dim=1)[0]
+        # Clamp to 0 just in case all were masked
+        bz_max = bz_max.clamp(min=0.0)
         
         # 2. Polarity mixture (indicator of PIL presence)
         # IMPROVED: Use soft thresholding for smoother gradients
-        bz_pos_soft = torch.sigmoid(10 * B_z) * mask  # Soft positive indicator
-        bz_neg_soft = torch.sigmoid(-10 * B_z) * mask  # Soft negative indicator
+        sig_pos = torch.sigmoid(10 * B_z)
+        sig_neg = torch.sigmoid(-10 * B_z)
+        
+        bz_pos_soft = torch.where(mask_bool, sig_pos, torch.zeros_like(sig_pos))
+        bz_neg_soft = torch.where(mask_bool, sig_neg, torch.zeros_like(sig_neg))
+        
         bz_pos = bz_pos_soft.sum(dim=(1, 2, 3)) / valid_count
         bz_neg = bz_neg_soft.sum(dim=(1, 2, 3)) / valid_count
         polarity_balance = (bz_pos * bz_neg).sqrt()  # High when balanced = PIL present
         
         # 3. Flow statistics
         u_mag = (u_x ** 2 + u_y ** 2 + 1e-8).sqrt()  # Add eps before sqrt
-        u_masked = u_mag * mask
+        u_masked = torch.where(mask_bool, u_mag, torch.zeros_like(u_mag))
+        
         u_mean = u_masked.sum(dim=(1, 2, 3)) / valid_count
-        u_max = u_masked.reshape(B, -1).max(dim=1)[0]
+        
+        u_for_max = torch.where(mask_bool, u_mag, torch.tensor(-1e9, device=u_mag.device))
+        u_max = u_for_max.reshape(B, -1).max(dim=1)[0].clamp(min=0.0)
         
         # 4. Flux transport: correlation of flow with field gradient
         # This is a key indicator of magnetic energy buildup
-        flux_transport = ((u_mag * B_z.abs()) * mask).sum(dim=(1, 2, 3)) / valid_count
+        ft_val = u_mag * B_z.abs()
+        flux_transport = torch.where(mask_bool, ft_val, torch.zeros_like(ft_val)).sum(dim=(1, 2, 3)) / valid_count
         
         # 5. Temporal variability (rate of change indicator)
         if T > 1:
             # First-order difference (velocity of change)
             dBz_dt = (B_z[:, 1:] - B_z[:, :-1]).abs()
-            mask_dt = mask[:, 1:] * mask[:, :-1]
-            temporal_var = (dBz_dt * mask_dt).sum(dim=(1, 2, 3)) / (mask_dt.sum(dim=(1, 2, 3)) + 1e-8)
+            mask_dt = mask_float[:, 1:] * mask_float[:, :-1]
+            mask_dt_bool = mask_dt.bool()
+            
+            dBz_dt_masked = torch.where(mask_dt_bool, dBz_dt, torch.zeros_like(dBz_dt))
+            temporal_var = dBz_dt_masked.sum(dim=(1, 2, 3)) / (mask_dt.sum(dim=(1, 2, 3)) + 1e-8)
+            
+            # SOTA: Second-order difference (acceleration) - critical for flare precursors
+            # Rapid acceleration often precedes flares
+            if T > 2:
+                d2Bz_dt2 = (dBz_dt[:, 1:] - dBz_dt[:, :-1]).abs()
+                mask_dt2 = mask_dt[:, 1:] * mask_dt[:, :-1]
+                mask_dt2_bool = mask_dt2.bool()
+                d2Bz_dt2_masked = torch.where(mask_dt2_bool, d2Bz_dt2, torch.zeros_like(d2Bz_dt2))
+                temporal_accel = d2Bz_dt2_masked.sum(dim=(1, 2, 3)) / (mask_dt2.sum(dim=(1, 2, 3)) + 1e-8)
+            else:
+                temporal_accel = torch.zeros(B, device=B_z.device)
+            
+            # SOTA: Evolution rate variance - high variance indicates unstable evolution
+            dBz_dt_sq = torch.where(mask_dt_bool, dBz_dt**2, torch.zeros_like(dBz_dt))
+            dBz_dt_mean_sq = temporal_var ** 2
+            dBz_dt_var = (dBz_dt_sq.sum(dim=(1, 2, 3)) / (mask_dt.sum(dim=(1, 2, 3)) + 1e-8)) - dBz_dt_mean_sq
+            evolution_rate_var = dBz_dt_var.clamp(min=0).sqrt()
         else:
             temporal_var = torch.zeros(B, device=B_z.device)
+            temporal_accel = torch.zeros(B, device=B_z.device)
+            evolution_rate_var = torch.zeros(B, device=B_z.device)
         
         # 6. Vector potential complexity (proxy for current density complexity)
-        az_var = (A_z ** 2 * mask).sum(dim=(1, 2, 3)) / valid_count
+        az_val = A_z ** 2
+        az_var = torch.where(mask_bool, az_val, torch.zeros_like(az_val)).sum(dim=(1, 2, 3)) / valid_count
         az_std = az_var.clamp(min=1e-8).sqrt()
         
-        # Concatenate base physics features (9 features for backward compatibility)
+        # 7. Horizontal field features (if available)
+        if "B_x" in feats and "B_y" in feats:
+            B_x = feats["B_x"]
+            B_y = feats["B_y"]
+            
+            # Horizontal field magnitude
+            bh_mag = (B_x**2 + B_y**2 + 1e-8).sqrt()
+            bh_masked = torch.where(mask_bool, bh_mag, torch.zeros_like(bh_mag))
+            bh_mean = bh_masked.sum(dim=(1, 2, 3)) / valid_count
+            
+            # Total field magnitude  
+            btot_mag = (B_x**2 + B_y**2 + B_z**2 + 1e-8).sqrt()
+            btot_masked = torch.where(mask_bool, btot_mag, torch.zeros_like(btot_mag))
+            btot_mean = btot_masked.sum(dim=(1, 2, 3)) / valid_count
+            
+            # 8. Shear angle proxy: angle between horizontal field and potential field
+            # For a potential field, B would be nearly vertical at PIL
+            # Shear = Bh / Btot (high shear = more non-potential = flare prone)
+            shear_proxy = bh_mag / (btot_mag + 1e-8)
+            shear_masked = torch.where(mask_bool, shear_proxy, torch.zeros_like(shear_proxy))
+            shear_mean = shear_masked.sum(dim=(1, 2, 3)) / valid_count
+            
+            # 9. Free energy proxy: E_free ∝ Bh² (excess over potential field)
+            # This is a key predictor of flare energy
+            free_energy_proxy = bh_mag ** 2
+            fe_masked = torch.where(mask_bool, free_energy_proxy, torch.zeros_like(free_energy_proxy))
+            free_energy_mean = fe_masked.sum(dim=(1, 2, 3)) / valid_count
+        else:
+            bh_mean = torch.zeros_like(bz_mean)
+            btot_mean = bz_mean.abs()  # Fallback to |Bz|
+            shear_mean = torch.zeros_like(bz_mean)
+            free_energy_mean = torch.zeros_like(bz_mean)
+
+        # Concatenate base physics features (now 13 features when vector field available)
         physics_feats = torch.stack([
             bz_mean, bz_std, bz_max, polarity_balance,
             u_mean, u_max, flux_transport,
-            temporal_var, az_std
-        ], dim=-1)  # [B, 9]
+            temporal_var, az_std,
+            bh_mean, btot_mean,
+            shear_mean, free_energy_mean  # NEW: critical for flare prediction
+        ], dim=-1)  # [B, 13]
         
         # Handle any NaN that might occur
         physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -281,20 +444,6 @@ class PhysicsFeatureExtractor(nn.Module):
 class ClassifierHead(nn.Module):
     """
     Advanced classifier head with attention and physics features.
-    
-    Architecture:
-        1. Spatial attention pooling → focus on important regions
-        2. Physics feature extraction → domain-specific indicators
-        3. RF importance weighting → weight features by known importance
-        4. Temporal attention pooling → weight recent/active frames
-        5. MLP classifier → multi-horizon prediction
-        
-    Key improvements over baseline:
-        - Attention mechanisms for interpretable region weighting
-        - Physics-derived features (polarity balance, flux transport)
-        - RF guidance for feature weighting
-        - Temporal modeling of field evolution
-        - Residual connections for gradient flow
     """
     def __init__(
         self, 
@@ -303,12 +452,14 @@ class ClassifierHead(nn.Module):
         horizons: tuple[int, ...] = (6, 12, 24),
         use_attention: bool = True,
         use_physics_features: bool = True,
-        rf_importance_weights: Optional[torch.Tensor] = None
+        rf_importance_weights: Optional[torch.Tensor] = None,
+        n_scalar_features: int = 4,
     ):
         super().__init__()
         self.horizons = tuple(horizons)
         self.use_attention = use_attention
         self.use_physics_features = use_physics_features
+        self.n_scalar_features = n_scalar_features
         
         # Base features: A_z, B_z, u_x, u_y
         base_features = 4
@@ -321,7 +472,7 @@ class ClassifierHead(nn.Module):
         # Physics feature extractor
         if use_physics_features:
             self.physics_extractor = PhysicsFeatureExtractor()
-            physics_features = 9
+            physics_features = 13  # Updated: includes shear and free energy proxies
         else:
             physics_features = 0
         
@@ -333,13 +484,26 @@ class ClassifierHead(nn.Module):
             # Default: uniform weights
             self.register_buffer('rf_weights', torch.ones(physics_features) if physics_features > 0 else None)
         
-        # Compute total input features for final MLP
-        # With attention: base_features + base_features (stats) + physics_features
-        # Without attention: base_features + physics_features
-        if use_attention:
-            mlp_input = base_features + base_features + physics_features  # 4 + 4 + 9 = 17
+        # Scalar feature processing (R-value, GWPIL, etc.)
+        if n_scalar_features > 0:
+            self.scalar_proj = nn.Sequential(
+                nn.Linear(n_scalar_features, hidden // 4),
+                nn.SiLU(),
+                nn.Dropout(dropout * 0.5),
+            )
+            scalar_out_dim = hidden // 4
         else:
-            mlp_input = base_features + physics_features  # 4 + 9 = 13
+            self.scalar_proj = None
+            scalar_out_dim = 0
+        
+        # Compute total input features for final MLP
+        # With attention: pooled(4) + mean(4) + std(4) + max(4) = 16
+        # Plus physics features (9) + scalar features (hidden//4) = 25 + scalar_out
+        # Without attention: mean(4) + std(4) + physics_features(9) + scalar = 17 + scalar_out
+        if use_attention:
+            mlp_input = base_features * 4 + physics_features + scalar_out_dim
+        else:
+            mlp_input = base_features * 2 + physics_features + scalar_out_dim
         
         # Final classifier MLP with residual
         self.pre_mlp = nn.Sequential(
@@ -356,11 +520,17 @@ class ClassifierHead(nn.Module):
             nn.Linear(hidden // 2, len(horizons))
         )
 
-    def forward(self, feats: dict[str, torch.Tensor], observed_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        feats: dict[str, torch.Tensor], 
+        observed_mask: torch.Tensor,
+        scalars: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             feats: dict of tensors shaped [B, T, P, 1] for keys A_z, B_z, u_x, u_y
             observed_mask: [B, T] booleans (True for frames t <= t0)
+            scalars: [B, n_scalar_features] optional scalar features (R-value, GWPIL, etc.)
             
         Returns:
             logits: [B, n_horizons] classification logits
@@ -380,22 +550,39 @@ class ClassifierHead(nn.Module):
             # Temporal attention pooling
             X_pooled, temporal_weights = self.temporal_attn(X_spatial, observed_mask)  # [B, 4]
             
-            # Also compute simple statistics as backup
+            # IMPROVED: Compute comprehensive statistics for better feature representation
             mask_expanded = observed_mask[..., None, None].float()  # [B, T, 1, 1]
             X_masked = X * mask_expanded
-            valid_count = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0)  # [B, 1]
+            # FIXED: valid_count must account for spatial points P to avoid scaling issues
+            valid_count = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0) * P  # [B, 1]
+            
+            # Mean
             X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, 4]
             
-            # Combine attention and statistics
-            combined = torch.cat([X_pooled, X_mean], dim=-1)  # [B, 8]
+            # Standard deviation (more informative than just mean)
+            X_sq = (X_masked ** 2).sum(dim=(1, 2)) / valid_count
+            X_var = (X_sq - X_mean ** 2).clamp(min=1e-8)
+            X_std = X_var.sqrt()  # [B, 4]
+            
+            # Max absolute value (captures peak activity)
+            # Set masked values to large negative so they don't affect max
+            X_for_max = X.abs() * mask_expanded + (1 - mask_expanded) * (-1e9)
+            X_max = X_for_max.max(dim=2)[0].max(dim=1)[0]  # [B, 4]
+            
+            # Combine: attention pooled + mean + std + max = 16 features
+            combined = torch.cat([X_pooled, X_mean, X_std, X_max], dim=-1)  # [B, 16]
         else:
-            # Simple averaging fallback
+            # Improved fallback with mean + std statistics
             mask_expanded = observed_mask[..., None, None].float()
             X_masked = X * mask_expanded
-            denom_t = mask_expanded.sum(dim=1, keepdim=True).clamp_min(1.0)
-            X_t = X_masked.sum(dim=1, keepdim=True) / denom_t
-            X_avg = X_t.mean(dim=2).squeeze(1)  # [B, 4]
-            combined = X_avg
+            valid_count = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0)
+            
+            X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, 4]
+            X_sq = (X_masked ** 2).sum(dim=(1, 2)) / valid_count
+            X_var = (X_sq - X_mean ** 2).clamp(min=1e-8)
+            X_std = X_var.sqrt()  # [B, 4]
+            
+            combined = torch.cat([X_mean, X_std], dim=-1)  # [B, 8]
         
         # Physics features
         if self.use_physics_features:
@@ -406,6 +593,18 @@ class ClassifierHead(nn.Module):
                 physics_feats = physics_feats * self.rf_weights
             
             combined = torch.cat([combined, physics_feats], dim=-1)
+        
+        # Scalar features (R-value, GWPIL, observation coverage, etc.)
+        if self.scalar_proj is not None and scalars is not None:
+            # Normalize scalars for stability (log-transform large values)
+            scalars_safe = scalars.clone()
+            # R-value is already log-scale, GWPIL can be large
+            # Apply log1p to GWPIL (index 1) if it's large
+            if scalars_safe.shape[-1] > 1:
+                scalars_safe[:, 1] = torch.log1p(scalars_safe[:, 1].abs()) * torch.sign(scalars_safe[:, 1])
+            
+            scalar_feats = self.scalar_proj(scalars_safe)  # [B, hidden//4]
+            combined = torch.cat([combined, scalar_feats], dim=-1)
         
         # MLP classifier
         h = self.pre_mlp(combined)
