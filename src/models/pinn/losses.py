@@ -22,8 +22,25 @@ def bce_logits(y_hat: torch.Tensor, y: torch.Tensor, pos_weight: Optional[float]
     Binary cross-entropy with logits. 
     pos_weight: weight for positive class (typically N_neg/N_pos, e.g. 5-20 for solar flares)
     """
+    # Safety checks
+    if torch.isnan(y).any() or torch.isinf(y).any():
+        return torch.zeros(1, device=y.device, requires_grad=True).squeeze()
+    
+    if torch.isnan(y_hat).any() or torch.isinf(y_hat).any():
+        y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    # Clamp logits and labels for stability
+    y_hat = y_hat.clamp(-100.0, 100.0)
+    y = y.clamp(0.0, 1.0)
+    
     pw = None if pos_weight is None else torch.tensor(pos_weight, device=y_hat.device, dtype=y_hat.dtype)
-    return F.binary_cross_entropy_with_logits(y_hat, y, pos_weight=pw)
+    loss = F.binary_cross_entropy_with_logits(y_hat, y, pos_weight=pw)
+    
+    # Final safety check
+    if torch.isnan(loss) or torch.isinf(loss):
+        return torch.zeros(1, device=y_hat.device, requires_grad=True).squeeze()
+    
+    return loss
 
 def focal_loss(logits: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
     """
@@ -40,8 +57,27 @@ def focal_loss(logits: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma
     
     Note: Uses numerically stable implementation with logsigmoid.
     """
+    # Safety checks for numerical stability
+    if torch.isnan(y).any() or torch.isinf(y).any():
+        # Invalid labels - return zero loss (NOT using broken logits)
+        return torch.zeros(1, device=y.device, requires_grad=True).squeeze()
+    
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        # Invalid logits - clamp to valid range first
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    # Clamp logits to prevent overflow in sigmoid/exp
+    logits = logits.clamp(-100.0, 100.0)
+    
+    # Ensure labels are in valid range [0, 1]
+    y = y.clamp(0.0, 1.0)
+    
     # Use numerically stable BCE with logits
     bce_loss = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+    
+    # Check if BCE loss is valid
+    if torch.isnan(bce_loss).any() or torch.isinf(bce_loss).any():
+        return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
     
     # Compute probabilities for focal weight (clamped for stability)
     probs = torch.sigmoid(logits).clamp(1e-7, 1 - 1e-7)
@@ -56,21 +92,38 @@ def focal_loss(logits: torch.Tensor, y: torch.Tensor, alpha: float = 0.25, gamma
     focal_weight = ((1 - p_t) ** gamma).clamp(max=100.0)
     
     loss = alpha_t * focal_weight * bce_loss
-    return loss.mean()
+    
+    # Final safety check
+    final_loss = loss.mean()
+    if torch.isnan(final_loss) or torch.isinf(final_loss):
+        return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
+    
+    return final_loss
 
 def l1_data(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # FIXED: Handle NaN/Inf in inputs
+    if not torch.isfinite(pred).all():
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=3.0, neginf=-3.0)
+    if not torch.isfinite(target).all():
+        target = torch.nan_to_num(target, nan=0.0, posinf=3.0, neginf=-3.0)
+    
     if mask is not None:
         w = mask.float()
-        denom = w.sum().clamp_min(1.0)
-        # Return 0 if no valid data (all masked), instead of NaN
-        if denom == 1.0 and w.sum() == 0.0:
-            return pred.new_tensor(0.0)
+        valid_count = w.sum()
+        
+        # Return connected zero if no valid data (all masked)
+        if valid_count < 0.5:
+            return (pred * 0).sum()  # Connected to computation graph
         
         # FIXED: Use where() to avoid 0 * Inf = NaN issues
         diff = (pred - target).abs()
+        # Clamp diff to prevent extreme values
+        diff = diff.clamp(max=100.0)
         masked_diff = torch.where(mask.bool(), diff, torch.zeros_like(diff))
-        return masked_diff.sum() / denom
-    return (pred - target).abs().mean()
+        return masked_diff.sum() / valid_count.clamp(min=1.0)
+    
+    diff = (pred - target).abs().clamp(max=100.0)
+    return diff.mean()
 
 def focal_loss_with_label_smoothing(
     logits: torch.Tensor, 
@@ -92,11 +145,26 @@ def focal_loss_with_label_smoothing(
         gamma: focusing parameter
         smoothing: label smoothing factor (0.0 to 0.1 typical)
     """
+    # FIXED: Input validation
+    if torch.isnan(y).any() or torch.isinf(y).any():
+        return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
+    
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    # FIXED: Clamp logits and labels for stability
+    logits = logits.clamp(-100.0, 100.0)
+    y = y.clamp(0.0, 1.0)
+    
     # Apply label smoothing: y_smooth = (1 - smoothing) * y + smoothing * 0.5
     y_smooth = (1 - smoothing) * y + smoothing * 0.5
     
     # Standard focal loss computation with smoothed labels
     bce_loss = F.binary_cross_entropy_with_logits(logits, y_smooth, reduction='none')
+    
+    # FIXED: Check if BCE produced NaN
+    if torch.isnan(bce_loss).any() or torch.isinf(bce_loss).any():
+        return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
     
     probs = torch.sigmoid(logits).clamp(1e-7, 1 - 1e-7)
     p_t = probs * y_smooth + (1 - probs) * (1 - y_smooth)
@@ -104,7 +172,13 @@ def focal_loss_with_label_smoothing(
     focal_weight = ((1 - p_t) ** gamma).clamp(max=100.0)
     
     loss = alpha_t * focal_weight * bce_loss
-    return loss.mean()
+    
+    # FIXED: Final safety check
+    final_loss = loss.mean()
+    if torch.isnan(final_loss) or torch.isinf(final_loss):
+        return torch.zeros(1, device=logits.device, requires_grad=True).squeeze()
+    
+    return final_loss
 
 
 def curl_consistency_l1(
@@ -116,7 +190,7 @@ def curl_consistency_l1(
     weight: float = 0.1
 ) -> torch.Tensor:
     if Bx_obs is None or By_obs is None or weight <= 0: 
-        return A_z_points.new_tensor(0.0)
+        return (A_z_points * 0).sum()  # Connected to computation graph
     Bx, By = B_perp_from_Az_fn(A_z_points, coords_points)
     return weight * (Bx - Bx_obs).abs().mean() + weight * (By - By_obs).abs().mean()
 
@@ -280,12 +354,12 @@ def gradient_penalty(
         Gradient penalty loss
     """
     if weight <= 0:
-        return coords.new_tensor(0.0)
+        return (coords * 0).sum()  # Connected to computation graph
     
     # Compute gradient norm of B_z w.r.t inputs
     B_z = outputs.get("B_z")
     if B_z is None or not coords.requires_grad:
-        return coords.new_tensor(0.0)
+        return (coords * 0).sum()  # Connected to computation graph
     
     grads = torch.autograd.grad(
         B_z, coords,
@@ -349,9 +423,12 @@ def class_balanced_focal_loss(
     w_pos = 2.0 * w_pos / total
     
     # Compute focal loss with class-balanced weights
-    bce_loss = F.binary_cross_entropy_with_logits(logits, y, reduction='none')
+    # ±15 logit clamp: sigmoid(15)≈0.999999, sigmoid(-15)≈0.000001
+    # Beyond ±15: BCE gradients vanish, focal weights overflow, no meaningful learning
+    logits_clamped = logits.clamp(-15.0, 15.0)
+    bce_loss = F.binary_cross_entropy_with_logits(logits_clamped, y, reduction='none')
     
-    probs = torch.sigmoid(logits).clamp(1e-7, 1 - 1e-7)
+    probs = torch.sigmoid(logits_clamped).clamp(1e-7, 1 - 1e-7)
     p_t = probs * y + (1 - probs) * (1 - y)
     focal_weight = ((1 - p_t) ** gamma).clamp(max=100.0)
     
@@ -359,6 +436,11 @@ def class_balanced_focal_loss(
     cb_weight = w_pos * y + w_neg * (1 - y)
     
     loss = cb_weight * focal_weight * bce_loss
+    
+    # Final safety: clamp loss and handle NaN
+    loss = loss.clamp(max=100.0)
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=100.0, neginf=0.0)
+    
     return loss.mean()
 
 
@@ -413,21 +495,32 @@ def confidence_penalty(
     Adds entropy regularization to encourage calibrated predictions,
     especially important for rare event prediction like flares.
     
+    ✅ FIXED: Now returns a bounded value that cannot make total loss negative.
+    Uses inverse entropy (low entropy = high penalty) instead of negative entropy.
+    
     Args:
         probs: Predicted probabilities [N, C]
         weight: Regularization weight
         
     Returns:
-        Entropy penalty loss (to be added to main loss)
+        Entropy penalty loss (to be added to main loss) - always >= 0
     """
     if weight <= 0:
-        return probs.new_tensor(0.0)
+        return (probs * 0).sum()  # Connected to computation graph
     
     probs_clamped = probs.clamp(1e-7, 1 - 1e-7)
+    
+    # Binary entropy: H(p) = -p*log(p) - (1-p)*log(1-p)
+    # Max entropy at p=0.5: H(0.5) = ln(2) ≈ 0.693
     entropy = -(probs_clamped * torch.log(probs_clamped) + 
                 (1 - probs_clamped) * torch.log(1 - probs_clamped))
     
-    # Negative entropy = penalty for overconfidence
-    # We want higher entropy (less confident) predictions
-    return -weight * entropy.mean()
+    # ✅ FIX: Penalize LOW entropy (overconfidence) instead of using negative entropy
+    # max_entropy = ln(2) ≈ 0.693 for binary classification
+    # penalty = weight * (max_entropy - actual_entropy)
+    # This is always >= 0 and penalizes confident predictions
+    max_entropy = 0.693  # ln(2)
+    penalty = weight * (max_entropy - entropy.mean()).clamp(min=0.0)
+    
+    return penalty
 

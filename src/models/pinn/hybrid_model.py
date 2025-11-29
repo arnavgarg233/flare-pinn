@@ -9,7 +9,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,7 @@ from .collocation import clip_and_renorm_importance
 from .config import PINNConfig
 from .core import ClassifierHead
 from .hybrid_core import HybridPINNBackbone
+from .latent_sampling import sample_latent_soft_bilinear
 from .losses import (
     asymmetric_focal_loss,
     bce_logits,
@@ -132,14 +133,12 @@ class HybridPINNModel(nn.Module):
         # Hybrid backbone (CNN encoder + conditioned MLP)
         self.backbone = HybridPINNBackbone(
             encoder_in_channels=in_channels,
-            latent_channels=32,
-            global_dim=64,
+            encoder_cfg=cfg.model.encoder,
             hidden=cfg.model.hidden,
             layers=cfg.model.layers,
             max_log2_freq=cfg.model.fourier.max_log2_freq,
             film_layers=(3, 6, 9),
             learn_eta=cfg.model.learn_eta,
-            encoder_dropout=0.05,
             n_field_components=self.n_components
         )
         
@@ -150,8 +149,11 @@ class HybridPINNModel(nn.Module):
         use_attention = getattr(cfg.classifier, 'use_attention', True)
         use_physics_features = getattr(cfg.classifier, 'use_physics_features', True)
         
-        # Scalar features count from config (default: R-value, GWPIL, obs_coverage, frame_count)
-        n_scalar_features = len(cfg.data.scalar_features) if cfg.data.scalar_features else 4
+        # Scalar features count from config
+        # CRITICAL FIX: Use the computed n_scalar_features property which accounts for
+        # base features + PIL evolution (8) + temporal statistics (4) = up to 16 features
+        # The dataset (ConsolidatedWindowsDataset) produces 16 features when SOTA features enabled
+        n_scalar_features = cfg.data.n_scalar_features  # Use computed property from DataConfig
         
         self.classifier = ClassifierHead(
             hidden=cfg.classifier.hidden,
@@ -161,6 +163,7 @@ class HybridPINNModel(nn.Module):
             use_physics_features=use_physics_features,
             rf_importance_weights=rf_weights,
             n_scalar_features=n_scalar_features,
+            n_field_components=self.n_components,  # FIXED: Pass component count for proper dimensioning
         )
         
         # Physics module - use vector version for multi-component fields
@@ -190,6 +193,26 @@ class HybridPINNModel(nn.Module):
         self.register_buffer("_n_negative", torch.tensor(1000.0))
         self.register_buffer("_n_positive", torch.tensor(50.0))
         self._samples_seen = 0
+        
+        # LRA (Learning Rate Annealing) state - Wang et al. 2021
+        # Running average of gradient norms for automatic loss balancing
+        self.register_buffer("_lra_grad_norm_data", torch.tensor(1.0))
+        self.register_buffer("_lra_grad_norm_phys", torch.tensor(1.0))
+        self.register_buffer("_lra_lambda", torch.tensor(1.0))
+        self.register_buffer("_lra_step", torch.tensor(0))  # ✅ FIX: Buffer for checkpoint persistence
+        
+        # GradNorm state - Chen et al. 2018 (Multi-task learning)
+        # Automatically balances task weights by equalizing gradient scales
+        n_tasks = 2  # Classification + Physics
+        self.register_buffer("_gradnorm_weights", torch.ones(n_tasks))
+        self.register_buffer("_gradnorm_init_losses", torch.ones(n_tasks))
+        self.register_buffer("_gradnorm_init_set", torch.tensor(False))
+        self.register_buffer("_gradnorm_step", torch.tensor(0))  # ✅ FIX: Buffer for checkpoint persistence
+        
+        # Adaptive collocation state - McClenny & Braga-Neto 2020 (RAR)
+        # Store residuals for resampling
+        self.register_buffer("_residual_history", torch.zeros(4096))
+        self._collocation_step = 0
     
     def _get_rf_weights(self, cfg: PINNConfig) -> Optional[torch.Tensor]:
         """Get RF importance weights from file or defaults."""
@@ -305,16 +328,529 @@ class HybridPINNModel(nn.Module):
         return mean_probs, std_probs
     
     def get_lambda_phys(self) -> float:
-        """Get physics loss weight based on training progress."""
+        """Get physics loss weight based on training progress or LRA."""
         if not self.cfg.physics.enable:
             return 0.0
-        frac = float(self._train_frac.item())
+        
+        # If LRA is enabled, use the adaptive lambda
+        # Clamp to reasonable range for classification + physics (max 2.0)
+        if getattr(self.cfg.physics, 'use_lra', False):
+            return float(self._lra_lambda.detach().clamp(0.01, 2.0))
+        
+        # If GradNorm is enabled, return 1.0 to avoid double scaling
+        # GradNorm handles the balancing via w_phys, so we don't want the schedule to interfere
+        if getattr(self.cfg.physics, 'use_gradnorm', False):
+            return 1.0
+        
+        # Otherwise use scheduled lambda
+        frac = float(self._train_frac.detach())
         lam = interp_schedule(self.cfg.physics.lambda_phys_schedule, frac)
         return min(lam, 50.0)  # Safety cap
     
+    def update_lra(
+        self,
+        loss_data: torch.Tensor,
+        loss_phys: torch.Tensor,
+    ) -> float:
+        """
+        Update LRA (Learning Rate Annealing) weights based on gradient norms.
+        
+        Wang et al. 2021: "Understanding and Mitigating Gradient Pathologies in PINNs"
+        
+        The key idea: Balance gradient magnitudes so both data and physics losses
+        contribute equally to the optimization.
+        
+        λ_phys = mean(|∇L_data|) / mean(|∇L_phys|)
+        
+        Args:
+            loss_data: Data/classification loss (scalar tensor)
+            loss_phys: Physics loss (scalar tensor)
+            
+        Returns:
+            Updated lambda_phys value
+        """
+        if not self.cfg.physics.enable or not getattr(self.cfg.physics, 'use_lra', False):
+            return self.get_lambda_phys()
+        
+        self._lra_step.add_(1)  # ✅ FIX: In-place increment for buffer
+        update_freq = getattr(self.cfg.physics, 'lra_update_freq', 1)
+        
+        # ✅ FIX: Safely get current lambda value to avoid MPS hangs
+        def get_current_lambda() -> float:
+            return float(self._lra_lambda.detach().cpu())
+        
+        # Only update every N steps to reduce compute overhead
+        if int(self._lra_step.item()) % update_freq != 0:
+            return get_current_lambda()
+        
+        # Skip if losses don't require grad
+        if not loss_data.requires_grad or not loss_phys.requires_grad:
+            return get_current_lambda()
+        
+        # Skip if losses are invalid
+        with torch.no_grad():
+            if not torch.isfinite(loss_data) or not torch.isfinite(loss_phys):
+                return get_current_lambda()
+            
+            # ✅ FIX: Use detach().cpu() to avoid MPS hangs
+            loss_phys_val = float(loss_phys.detach().cpu())
+            loss_data_val = float(loss_data.detach().cpu())
+        
+        # ✅ FIX: Raised threshold for stability
+        if loss_phys_val < 1e-6 or loss_data_val < 1e-8:
+            return get_current_lambda()
+        
+        # Compute gradient norms for each loss
+        # We need to compute gradients w.r.t. a shared parameter set
+        try:
+            # Get a representative set of parameters (MLP layers)
+            params = [p for p in self.backbone.parameters() if p.requires_grad]
+            if not params:
+                return get_current_lambda()
+            
+            # Compute gradient of data loss
+            grads_data = torch.autograd.grad(
+                loss_data, params, 
+                retain_graph=True, 
+                allow_unused=True,
+                create_graph=False  # No need for 2nd order here
+            )
+            
+            # ✅ FIX: Check if we got any valid gradients
+            valid_grads_data = [g for g in grads_data if g is not None]
+            if not valid_grads_data:
+                return get_current_lambda()
+            
+            grad_norm_data = sum(
+                g.abs().mean() for g in valid_grads_data
+            ) / len(valid_grads_data)
+            
+            # Compute gradient of physics loss
+            grads_phys = torch.autograd.grad(
+                loss_phys, params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False
+            )
+            
+            valid_grads_phys = [g for g in grads_phys if g is not None]
+            if not valid_grads_phys:
+                return get_current_lambda()
+            
+            grad_norm_phys = sum(
+                g.abs().mean() for g in valid_grads_phys
+            ) / len(valid_grads_phys)
+            
+            # ✅ FIX: Check for NaN/Inf in gradient norms
+            with torch.no_grad():
+                if not torch.isfinite(grad_norm_data) or not torch.isfinite(grad_norm_phys):
+                    return get_current_lambda()
+                
+                # ✅ FIX: Get values safely
+                gnorm_data_val = float(grad_norm_data.detach().cpu())
+                gnorm_phys_val = float(grad_norm_phys.detach().cpu())
+            
+            # ✅ FIX: Skip if gradient norms are too small
+            if gnorm_data_val < 1e-8 or gnorm_phys_val < 1e-8:
+                return get_current_lambda()
+            
+        except RuntimeError:
+            # Gradient computation failed, keep current lambda
+            return get_current_lambda()
+        
+        # Update running averages with exponential moving average (in no_grad)
+        with torch.no_grad():
+            alpha = getattr(self.cfg.physics, 'lra_alpha', 0.9)
+            self._lra_grad_norm_data.mul_(alpha).add_(gnorm_data_val, alpha=1-alpha)
+            self._lra_grad_norm_phys.mul_(alpha).add_(gnorm_phys_val, alpha=1-alpha)
+            
+            # ✅ FIX: Get EMA values safely
+            ema_data = float(self._lra_grad_norm_data.detach().cpu())
+            ema_phys = float(self._lra_grad_norm_phys.detach().cpu())
+            
+            # Compute adaptive lambda: balance gradient magnitudes
+            # λ_phys = |∇L_data| / |∇L_phys|
+            # This makes physics gradients have same magnitude as data gradients
+            ratio = ema_data / max(ema_phys, 1e-8)
+            
+            # Clamp to reasonable range (max 2.0 so physics doesn't dominate classification)
+            new_lambda = max(0.01, min(2.0, ratio))
+            
+            # ✅ FIX: Check for NaN before storing
+            import math
+            if not math.isfinite(new_lambda):
+                return get_current_lambda()
+            
+            self._lra_lambda.fill_(new_lambda)
+            
+            return new_lambda
+    
+    def update_gradnorm(
+        self,
+        loss_cls: torch.Tensor,
+        loss_phys: torch.Tensor,
+        shared_params: list[nn.Parameter],
+    ) -> tuple[float, float]:
+        """
+        Update GradNorm weights for automatic multi-task balancing.
+        
+        Chen et al. 2018: "GradNorm: Gradient Normalization for Adaptive Loss Balancing"
+        
+        Key idea: Balance gradient magnitudes across tasks while allowing faster/slower
+        task learning based on relative progress. More principled than LRA.
+        
+        Algorithm:
+        1. Compute gradient norms for each task
+        2. Compute inverse training rate r_i(t) = L_i(t) / L_i(0)
+        3. Compute average rate: r_avg(t) = mean(r_i(t))
+        4. Target gradient norm: G̃_i = [r_i(t) / r_avg(t)]^α * mean(G_j)
+        5. Update task weights to minimize |G_i - G̃_i|
+        
+        Args:
+            loss_cls: Classification loss (scalar)
+            loss_phys: Physics loss (scalar)
+            shared_params: Shared parameters to compute gradients on (e.g., backbone)
+            
+        Returns:
+            (weight_cls, weight_phys): Task weights
+        """
+        if not getattr(self.cfg.physics, 'use_gradnorm', False):
+            return (1.0, self.get_lambda_phys())
+        
+        self._gradnorm_step.add_(1)  # ✅ FIX: In-place increment for buffer
+        update_freq = getattr(self.cfg.physics, 'gradnorm_update_freq', 5)
+        
+        # Only update every N steps
+        if int(self._gradnorm_step.item()) % update_freq != 0:
+            w_cls = float(self._gradnorm_weights[0].detach().cpu())
+            w_phys = float(self._gradnorm_weights[1].detach().cpu())
+            return (w_cls, w_phys)
+        
+        # ✅ FIX: Safely get current weights to avoid MPS issues
+        def get_current_weights() -> tuple[float, float]:
+            return (
+                float(self._gradnorm_weights[0].detach().cpu()),
+                float(self._gradnorm_weights[1].detach().cpu())
+            )
+        
+        # Skip if losses don't require grad (can't compute gradients)
+        if not loss_cls.requires_grad or not loss_phys.requires_grad:
+            return get_current_weights()
+        
+        # Skip if losses are invalid
+        with torch.no_grad():
+            if not torch.isfinite(loss_cls) or not torch.isfinite(loss_phys):
+                return get_current_weights()
+            
+            # ✅ FIX: Use detach().cpu() to avoid MPS hangs
+            loss_cls_val = float(loss_cls.detach().cpu())
+            loss_phys_val = float(loss_phys.detach().cpu())
+        
+        # ✅ FIX: Skip if physics loss is too small (< 1e-3)
+        # This prevents division by tiny numbers which causes NaN gradients
+        # Raised threshold to 1e-3 for more stability on MPS
+        if loss_phys_val < 1e-3 or loss_cls_val < 1e-6:
+            return get_current_weights()
+        
+        # Initialize on first step
+        if not self._gradnorm_init_set.item():
+            with torch.no_grad():
+                # ✅ FIX: Use clamped values to avoid extreme initial values
+                self._gradnorm_init_losses[0] = max(loss_cls_val, 1e-4)
+                self._gradnorm_init_losses[1] = max(loss_phys_val, 1e-4)
+                self._gradnorm_init_set.fill_(True)
+            return (1.0, 1.0)
+        
+        # Skip if no shared parameters
+        if not shared_params:
+            return get_current_weights()
+        
+        try:
+            # Step 1: Compute gradient norms for each task
+            # ✅ FIX: Wrap in try-except and check for empty gradients
+            grads_cls = torch.autograd.grad(
+                loss_cls, shared_params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False
+            )
+            
+            # Count valid gradients
+            valid_grads_cls = [g for g in grads_cls if g is not None]
+            if not valid_grads_cls:
+                return get_current_weights()
+            
+            grad_norm_cls = sum((g ** 2).sum() for g in valid_grads_cls).sqrt()
+            
+            grads_phys = torch.autograd.grad(
+                loss_phys, shared_params,
+                retain_graph=True,
+                allow_unused=True,
+                create_graph=False
+            )
+            
+            valid_grads_phys = [g for g in grads_phys if g is not None]
+            if not valid_grads_phys:
+                return get_current_weights()
+            
+            grad_norm_phys = sum((g ** 2).sum() for g in valid_grads_phys).sqrt()
+            
+            # ✅ FIX: Check for NaN/Inf in gradients (use .any() not .all())
+            with torch.no_grad():
+                if not torch.isfinite(grad_norm_cls) or not torch.isfinite(grad_norm_phys):
+                    return get_current_weights()
+                
+                # ✅ FIX: Use detach().cpu() to get values safely
+                gnorm_cls_val = float(grad_norm_cls.detach().cpu())
+                gnorm_phys_val = float(grad_norm_phys.detach().cpu())
+            
+            # ✅ FIX: Skip if gradient norms are too small (raised threshold)
+            if gnorm_cls_val < 1e-6 or gnorm_phys_val < 1e-6:
+                return get_current_weights()
+            
+        except RuntimeError as e:
+            # Gradient computation failed - common on MPS with certain operations
+            return get_current_weights()
+        
+        # Step 2-5: Update weights (all in no_grad to avoid graph issues)
+        with torch.no_grad():
+            # ✅ FIX: Get init losses safely
+            init_cls = float(self._gradnorm_init_losses[0].detach().cpu())
+            init_phys = float(self._gradnorm_init_losses[1].detach().cpu())
+            
+            # Compute inverse training rates r_i(t) = L_i(t) / L_i(0)
+            # ✅ FIX: Add epsilon to prevent division by zero
+            rate_cls = loss_cls_val / max(init_cls, 1e-6)
+            rate_phys = loss_phys_val / max(init_phys, 1e-6)
+            
+            # ✅ FIX: Clamp rates to prevent extreme values
+            rate_cls = max(0.01, min(100.0, rate_cls))
+            rate_phys = max(0.01, min(100.0, rate_phys))
+            
+            # Step 3: Average rate
+            rate_avg = (rate_cls + rate_phys) / 2.0
+            
+            # Step 4: Compute target gradient norms
+            # G̃_i = [r_i(t) / r_avg(t)]^α * mean(G_j)
+            alpha = getattr(self.cfg.physics, 'gradnorm_alpha', 1.5)
+            mean_grad = (gnorm_cls_val + gnorm_phys_val) / 2.0
+            
+            # ✅ FIX: Clamp ratio before power to avoid extreme values
+            rate_ratio_cls = max(0.1, min(10.0, rate_cls / max(rate_avg, 1e-6)))
+            rate_ratio_phys = max(0.1, min(10.0, rate_phys / max(rate_avg, 1e-6)))
+            
+            target_grad_cls = (rate_ratio_cls ** alpha) * mean_grad
+            target_grad_phys = (rate_ratio_phys ** alpha) * mean_grad
+            
+            # ✅ FIX: Check for NaN/Inf in targets (use math.isfinite for Python floats)
+            import math
+            if not math.isfinite(target_grad_cls) or not math.isfinite(target_grad_phys):
+                return get_current_weights()
+            
+            # Step 5: Update weights to minimize |G_i - G̃_i|
+            lr_gradnorm = 0.05  # ✅ FIX: Even slower learning rate for stability
+            
+            w_cls = float(self._gradnorm_weights[0].detach().cpu())
+            w_phys = float(self._gradnorm_weights[1].detach().cpu())
+            
+            # ✅ FIX: Simpler, more stable update rule
+            # Move weights towards target/actual ratio
+            target_w_cls = target_grad_cls / max(gnorm_cls_val, 1e-6)
+            target_w_phys = target_grad_phys / max(gnorm_phys_val, 1e-6)
+            
+            # ✅ FIX: Clamp targets before applying
+            # Allow symmetric ranges for both tasks to enable proper balancing
+            target_w_cls = max(0.3, min(5.0, target_w_cls))
+            target_w_phys = max(0.3, min(5.0, target_w_phys))
+            
+            # Exponential moving average towards target
+            w_cls = w_cls * (1 - lr_gradnorm) + target_w_cls * lr_gradnorm
+            w_phys = w_phys * (1 - lr_gradnorm) + target_w_phys * lr_gradnorm
+            
+            # ✅ FIX: Clamp AFTER update as well
+            # Symmetric ranges allow GradNorm to properly balance tasks
+            w_cls = max(0.3, min(5.0, w_cls))
+            w_phys = max(0.3, min(5.0, w_phys))
+            
+            # ✅ FIX: Check for NaN before storing
+            if not math.isfinite(w_cls) or not math.isfinite(w_phys):
+                return get_current_weights()
+            
+            # Renormalize to keep sum constant
+            w_sum = w_cls + w_phys
+            w_cls = w_cls * 2.0 / max(w_sum, 1e-6)
+            w_phys = w_phys * 2.0 / max(w_sum, 1e-6)
+            
+            # Store updated weights
+            self._gradnorm_weights[0] = w_cls
+            self._gradnorm_weights[1] = w_phys
+            
+            return (w_cls, w_phys)
+    
+    def adaptive_resample_collocation(
+        self,
+        coords: torch.Tensor,
+        model_func: Callable[[torch.Tensor], dict],
+        imp_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Adaptive collocation point resampling based on physics residual magnitude.
+        
+        McClenny & Braga-Neto 2020: "Self-Adaptive Physics-Informed Neural Networks"
+        (RAR - Residual Adaptive Resampling)
+        
+        Key idea: Focus compute on regions where physics is violated most.
+        
+        Algorithm:
+        1. Compute physics residual at each collocation point
+        2. Keep top-k% highest residual points (hard regions)
+        3. Resample remaining points uniformly (exploration)
+        
+        Args:
+            coords: [N, 3] collocation points
+            model_func: Function mapping coords -> field dict
+            imp_weights: [N, 1] current importance weights
+            
+        Returns:
+            (new_coords, new_imp_weights): Resampled points and weights
+        """
+        if not getattr(self.cfg.collocation, 'use_adaptive_resampling', False):
+            return coords, imp_weights
+        
+        self._collocation_step += 1
+        resample_freq = getattr(self.cfg.collocation, 'adaptive_resample_freq', 10)
+        
+        # Only resample every N steps
+        if self._collocation_step % resample_freq != 0:
+            return coords, imp_weights
+        
+        N = coords.shape[0]
+        keep_ratio = getattr(self.cfg.collocation, 'adaptive_keep_ratio', 0.3)
+        n_keep = int(keep_ratio * N)
+        n_resample = N - n_keep
+        
+        # Safety check: need at least some points to keep and resample
+        if n_keep < 10 or n_resample < 10:
+            return coords, imp_weights
+        
+        # Evaluate model to get residuals
+        # We need to enable gradients for residual computation
+        with torch.enable_grad():
+            # Ensure coords require grad
+            if not coords.requires_grad:
+                coords.requires_grad_(True)
+            
+            try:
+                field_dict = model_func(coords)
+            except RuntimeError:
+                # Model forward failed, fall back to current weights
+                return coords, imp_weights
+            
+            # Extract B and u for residual computation
+            # Handle both scalar and vector modes
+            if "B" in field_dict:
+                B = field_dict["B"]
+            else:
+                B = field_dict.get("B_z")
+                if B is None:
+                    return coords, imp_weights
+            
+            if "u" in field_dict:
+                u = field_dict["u"]
+            else:
+                u_x = field_dict.get("u_x")
+                u_y = field_dict.get("u_y")
+                if u_x is None or u_y is None:
+                    return coords, imp_weights
+                u = torch.cat([u_x, u_y], dim=-1)
+
+            # Compute physics residual magnitude at each point
+            # For weak-form induction: residual ≈ |∂B/∂t + ∇×(u×B) - η∇²B|
+            # As a proxy, use the gradient magnitudes
+            try:
+                B_grads = torch.autograd.grad(
+                    B.sum(), coords,
+                    create_graph=False, retain_graph=True,
+                    allow_unused=True
+                )[0]
+                
+                u_grads = torch.autograd.grad(
+                    u.sum(), coords,
+                    create_graph=False, retain_graph=True,
+                    allow_unused=True
+                )[0]
+                
+                if B_grads is None or u_grads is None:
+                    return coords, imp_weights
+                
+                # Check for NaN/Inf in gradients
+                if torch.isnan(B_grads).any() or torch.isinf(B_grads).any():
+                    B_grads = torch.nan_to_num(B_grads, nan=0.0, posinf=1.0, neginf=-1.0)
+                if torch.isnan(u_grads).any() or torch.isinf(u_grads).any():
+                    u_grads = torch.nan_to_num(u_grads, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                B_grad_mag = B_grads.norm(dim=-1)
+                u_grad_mag = u_grads.norm(dim=-1)
+                
+                # Combined residual proxy
+                residual_mag = B_grad_mag + u_grad_mag
+                
+                # Safety: handle NaN in residual magnitudes
+                if torch.isnan(residual_mag).any():
+                    residual_mag = torch.nan_to_num(residual_mag, nan=0.0)
+                
+            except RuntimeError:
+                # Gradient computation failed, fall back to current weights
+                return coords, imp_weights
+            
+            # Store for monitoring
+            with torch.no_grad():
+                if residual_mag.numel() <= self._residual_history.numel():
+                    self._residual_history[:residual_mag.numel()] = residual_mag.detach()
+            
+            # Get top-k highest residual points
+            _, top_indices = torch.topk(residual_mag, n_keep, largest=True)
+            
+            # Resample remaining points uniformly in [-1, 1]^3
+            new_coords_resample = torch.rand(
+                n_resample, 3,
+                device=coords.device,
+                dtype=coords.dtype
+            ) * 2.0 - 1.0
+            
+            # Combine: keep high-residual points + new uniform samples
+            # ✅ FIX: Only detach when using mps_fast_physics (create_graph=False)
+            # When create_graph=True, we need gradient flow through kept coords back to backbone
+            use_fast_physics = getattr(self.cfg.physics, 'mps_fast_physics', False)
+            if use_fast_physics:
+                coords_keep = coords[top_indices].detach()  # Safe to detach with create_graph=False
+            else:
+                coords_keep = coords[top_indices]  # Preserve gradient graph for create_graph=True
+            new_coords = torch.cat([coords_keep, new_coords_resample], dim=0)
+            new_coords.requires_grad_(True)
+            
+            # ✅ FIX: Create NEW importance weights for the resampled points
+            # Kept points: use their original importance weights, scaled up (2x for hard regions)
+            # Resampled points: uniform importance weight (1.0)
+            with torch.no_grad():
+                # Get importance weights for kept points
+                kept_weights = imp_weights[top_indices] * 2.0  # 2x weight for hard regions
+                
+                # New points get uniform weight
+                uniform_weights = torch.ones(n_resample, 1, device=imp_weights.device)
+                
+                # Combine weights
+                new_imp_weights = torch.cat([kept_weights, uniform_weights], dim=0)
+                
+                # Renormalize so weights sum to N (mean = 1)
+                new_imp_weights = new_imp_weights * (N / new_imp_weights.sum().clamp(min=1e-6))
+            
+        return new_coords, new_imp_weights
+    
     def get_collocation_alpha(self) -> float:
         """Get PIL importance weight based on training progress."""
-        frac = float(self._train_frac.item())
+        # FIXED: Avoid .item() which can hang on MPS
+        frac = float(self._train_frac.detach())
         a0 = self.cfg.collocation.alpha_start
         a1 = self.cfg.collocation.alpha_end
         return a0 + (a1 - a0) * frac
@@ -339,29 +875,7 @@ class HybridPINNModel(nn.Module):
             L: [1, C, H, W] - Latent feature map
             g: [1, D] - Global code
         """
-        if getattr(self.backbone, 'use_temporal_encoder', False):
-            return self.backbone.encode(frames, observed_mask)
-        
-        # Fallback for TinyEncoder: manually aggregate frames
-        obs_frames = frames[observed_mask]
-        
-        if obs_frames.shape[0] == 0:
-            device = frames.device
-            H, W = frames.shape[-2:]
-            latent_ch = self.backbone.effective_latent_channels
-            L = torch.zeros(1, latent_ch, H, W, device=device)
-            g = torch.zeros(1, 64, device=device)
-            return L, g
-        
-        # Aggregate observed frames by mean
-        if obs_frames.dim() == 3:
-            # [T, H, W] -> [1, 1, H, W]
-            frames_input = obs_frames.mean(dim=0, keepdim=True).unsqueeze(0)
-        else:
-            # [T, C, H, W] -> [1, C, H, W]
-            frames_input = obs_frames.mean(dim=0, keepdim=True)
-            
-        return self.backbone.encode(frames_input)
+        return self.backbone.encode(frames, observed_mask)
     
     def query_field(
         self,
@@ -386,13 +900,23 @@ class HybridPINNModel(nn.Module):
         """Update running class counts for class-balanced loss."""
         with torch.no_grad():
             # Count positives and negatives across all horizons
-            n_pos = labels.sum().item()
+            # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
+            n_pos = float(labels.sum().detach().cpu())
             n_neg = labels.numel() - n_pos
+            
+            # Safety check for valid counts
+            if not (0 <= n_pos <= labels.numel()) or not (0 <= n_neg <= labels.numel()):
+                return  # Skip update if counts are invalid
             
             # Exponential moving average update
             momentum = 0.99 if self._samples_seen > 100 else 0.5
             self._n_positive.lerp_(torch.tensor(max(1.0, n_pos), device=labels.device), 1 - momentum)
             self._n_negative.lerp_(torch.tensor(max(1.0, n_neg), device=labels.device), 1 - momentum)
+            
+            # Clamp buffers to prevent overflow
+            self._n_positive.clamp_(1.0, 1e6)
+            self._n_negative.clamp_(1.0, 1e6)
+            
             self._samples_seen += 1
     
     def compute_classification_loss(
@@ -406,11 +930,16 @@ class HybridPINNModel(nn.Module):
         if self.training:
             self.update_class_counts(labels)
         
-        # Get current class count estimates
-        samples_per_class = (
-            int(self._n_negative.item()),
-            int(self._n_positive.item())
-        )
+        # Get current class count estimates with safety checks
+        # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
+        n_neg = float(self._n_negative.detach().cpu())
+        n_pos = float(self._n_positive.detach().cpu())
+        
+        # Clamp to valid range before converting to int
+        n_neg = max(1.0, min(1e6, n_neg))
+        n_pos = max(1.0, min(1e6, n_pos))
+        
+        samples_per_class = (int(n_neg), int(n_pos))
         
         label_smoothing = getattr(self.cfg.classifier, 'label_smoothing', 0.0)
         loss_type = self.cfg.classifier.loss_type
@@ -459,6 +988,11 @@ class HybridPINNModel(nn.Module):
         conf_penalty_weight = getattr(self.cfg.classifier, 'confidence_penalty', 0.0)
         if conf_penalty_weight > 0:
             loss = loss + confidence_penalty(probs, conf_penalty_weight)
+        
+        # ✅ SAFETY: Classification loss should be bounded and non-NaN
+        # Clamp to prevent extreme values and handle NaN/Inf
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=10.0, neginf=0.0)
+        loss = loss.clamp(min=0.0, max=100.0)
         
         return loss
     
@@ -548,7 +1082,8 @@ class HybridPINNModel(nn.Module):
             pil_values = pil_mask[y_px, x_px].float()
             
             p_uniform = 0.125
-            pil_sum = pil_mask.sum().item()
+            # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
+            pil_sum = float(pil_mask.sum().detach().cpu())
             pil_frac = pil_sum / (H_pil * W_pil) if pil_sum > 0 else 1.0
             p_pil = (1.0 / (4.0 * pil_frac) * 0.5) if pil_frac > 0 else p_uniform
             p_spatial = alpha * p_pil * pil_values + (1 - alpha) * p_uniform
@@ -564,10 +1099,55 @@ class HybridPINNModel(nn.Module):
                 self.cfg.collocation.impw_clip_quantile
             )
         
+        # Apply causal weighting if enabled
+        # NOTE: This is different from use_causal_weighting in physics.py
+        # use_causal_training: Weights collocation points BEFORE physics computation
+        # use_causal_weighting: Weights residuals AFTER physics computation
+        # Only use ONE of these, not both!
+        if getattr(self.cfg.physics, 'use_causal_training', False):
+            # Extract time coordinate (normalized to [0, 1] from [-1, 1])
+            t_coords = coords_flat[:, 2:3]  # [N, 1]
+            
+            # ✅ FIX: Clamp time coordinates to valid range
+            t_coords = t_coords.clamp(-1.0, 1.0)
+            t_normalized = (t_coords + 1.0) / 2.0  # Map [-1, 1] → [0, 1]
+            
+            # Exponential decay: earlier times get higher weight
+            decay = getattr(self.cfg.physics, 'causal_decay', 2.0)
+            
+            # ✅ FIX: Clamp decay * t to avoid extreme exp values
+            # exp(-decay * t) where t in [0, 1] and decay ~2.0
+            # So exp(-2) ≈ 0.135 for t=1, which is fine
+            # But clamp anyway for safety
+            decay_arg = (decay * t_normalized).clamp(max=10.0)  # exp(-10) ≈ 4.5e-5
+            causal_weights = torch.exp(-decay_arg)  # [N, 1]
+            
+            # ✅ FIX: Check for NaN/Inf in causal weights
+            if torch.isnan(causal_weights).any() or torch.isinf(causal_weights).any():
+                causal_weights = torch.nan_to_num(causal_weights, nan=1.0, posinf=1.0, neginf=0.0)
+            
+            # ✅ FIX: Ensure causal weights are positive and bounded
+            causal_weights = causal_weights.clamp(min=1e-4, max=1.0)
+            
+            # Combine spatial and temporal importance
+            imp_weights = imp_weights * causal_weights
+            
+            # ✅ FIX: Renormalize with safety check
+            weight_sum = imp_weights.sum()
+            if weight_sum > 1e-6:
+                imp_weights = imp_weights / weight_sum
+            else:
+                # Fallback to uniform weights if sum is too small
+                imp_weights = torch.ones_like(imp_weights) / imp_weights.numel()
+        
         # Compute ESS
+        # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
         w_sum = imp_weights.sum()
         w_sq_sum = (imp_weights ** 2).sum()
-        ess = float((w_sum ** 2 / w_sq_sum).item()) if w_sq_sum > 0 else 0.0
+        with torch.no_grad():
+            w_sum_val = float(w_sum.detach().cpu())
+            w_sq_sum_val = float(w_sq_sum.detach().cpu())
+        ess = (w_sum_val ** 2 / w_sq_sum_val) if w_sq_sum_val > 0 else 0.0
         
         # Physics residual
         eta_mode = "field" if self.cfg.model.learn_eta else "scalar"
@@ -598,6 +1178,13 @@ class HybridPINNModel(nn.Module):
                     "u_y": u[..., 1:2],
                     "eta_raw": out["eta_raw"]
                 }
+        
+        # ✅ RAR: Adaptive Resampling
+        # If enabled, this will check frequency, evaluate model to find hard points,
+        # and return resampled coords. If not time to resample, returns originals.
+        coords_flat, imp_weights = self.adaptive_resample_collocation(
+            coords_flat, model_wrapper, imp_weights
+        )
 
         loss_phys_raw, _ = self.physics(
             model_wrapper,
@@ -607,8 +1194,21 @@ class HybridPINNModel(nn.Module):
             eta_scalar=self.cfg.model.eta_scalar
         )
         
-        # Apply physics gradient scaling to prevent dominating classification
-        scaled_loss = lambda_phys * loss_phys_raw * physics_grad_scale
+        # ✅ FIX: Just take absolute value (squaring made it too small!)
+        # The physics module returns a weighted residual that can be negative
+        loss_phys_raw = torch.abs(loss_phys_raw)
+        
+        # ✅ FIX: When using GradNorm, skip manual scaling - GradNorm handles balancing
+        # Otherwise, scale physics to be comparable to classification
+        use_gradnorm = getattr(self.cfg.physics, 'use_gradnorm', False)
+        if not use_gradnorm:
+            # Classification loss is ~0.01-0.1, physics was ~0.0001-0.001
+            # Scale to match for fixed lambda schedules
+            loss_phys_raw = loss_phys_raw * 100.0 * physics_grad_scale
+        # Note: When GradNorm is active, it automatically adjusts weights to equalize gradients
+        
+        # Apply lambda (1.0 when GradNorm active, scheduled otherwise)
+        scaled_loss = lambda_phys * loss_phys_raw
         
         return scaled_loss, ess
     
@@ -621,34 +1221,284 @@ class HybridPINNModel(nn.Module):
         lambda_phys: float,
         device: torch.device
     ) -> torch.Tensor:
-        """Aggregate losses with NaN safety checks."""
+        """
+        Aggregate losses with NaN safety checks.
+        
+        ✅ FIXED: Now properly applies GradNorm weights when enabled.
+        GradNorm (Chen et al. 2018) balances tasks by equalizing gradient scales.
+        """
         loss_components = []
         
-        if torch.isfinite(loss_cls):
-            loss_components.append(self.cfg.loss_weights.cls * loss_cls)
+        # FIXED: Use any() checks to avoid MPS synchronization issues from all()
+        with torch.no_grad():
+            cls_valid = loss_cls.numel() > 0 and not (torch.isnan(loss_cls).any() or torch.isinf(loss_cls).any())
+            data_valid = loss_data.numel() > 0 and not (torch.isnan(loss_data).any() or torch.isinf(loss_data).any())
+            curl_valid = loss_curl.numel() > 0 and not (torch.isnan(loss_curl).any() or torch.isinf(loss_curl).any())
+            phys_valid = loss_phys.numel() > 0 and not (torch.isnan(loss_phys).any() or torch.isinf(loss_phys).any())
         
-        if torch.isfinite(loss_data):
-            loss_components.append(self.cfg.loss_weights.data * loss_data)
+        # ✅ CRITICAL FIX: Get GradNorm weights (if enabled) to properly balance losses
+        use_gradnorm = getattr(self.cfg.physics, 'use_gradnorm', False) and self.cfg.physics.enable
+        if use_gradnorm:
+            # GradNorm weights from buffers (updated in update_gradnorm())
+            w_cls = float(self._gradnorm_weights[0].detach().cpu())
+            w_phys = float(self._gradnorm_weights[1].detach().cpu())
+        else:
+            # Standard fixed weights
+            w_cls = self.cfg.loss_weights.cls
+            w_phys = 1.0  # lambda_phys already applied
         
-        if torch.isfinite(loss_curl) and self.cfg.loss_weights.curl_consistency > 0:
-             loss_components.append(self.cfg.loss_weights.curl_consistency * loss_curl)
+        if cls_valid:
+            loss_components.append(w_cls * loss_cls)
         
-        if torch.isfinite(loss_phys) and lambda_phys > 0.01:
-            loss_components.append(loss_phys)
+        if data_valid:
+            # Data loss uses same weight as classification (both are "data fitting")
+            data_weight = self.cfg.loss_weights.data if not use_gradnorm else w_cls * 0.5
+            loss_components.append(data_weight * loss_data)
+        
+        if curl_valid and self.cfg.loss_weights.curl_consistency > 0:
+            loss_components.append(self.cfg.loss_weights.curl_consistency * loss_curl)
+        
+        if phys_valid and lambda_phys > 0.01:
+            # ✅ FIXED: Apply GradNorm w_phys when enabled (previously was just 1.0)
+            loss_components.append(w_phys * loss_phys)
         
         if loss_components:
-            loss_total = sum(loss_components)
+            # FIXED: Use reduce pattern that maintains gradient connection
+            loss_total = loss_components[0]
+            for lc in loss_components[1:]:
+                loss_total = loss_total + lc
         else:
-            loss_total = torch.tensor(0.01, device=device, requires_grad=True)
+            # FIXED: Create a connected zero rather than a constant
+            # Get a parameter to ensure connection
+            for param in self.parameters():
+                if param.requires_grad:
+                    loss_total = (param * 0.0).sum() + 0.01
+                    break
+            else:
+                loss_total = torch.tensor(0.01, device=device, requires_grad=True)
         
+        # FIXED: If final loss is not finite, replace with connected small value
         if not torch.isfinite(loss_total):
-            loss_total = torch.tensor(0.01, device=device, requires_grad=True)
+            for param in self.parameters():
+                if param.requires_grad:
+                    loss_total = (param * 0.0).sum() + 0.01
+                    break
+            else:
+                loss_total = torch.tensor(0.01, device=device, requires_grad=True)
         
         return loss_total
     
     # =========================================================================
     # Main Forward Pass
     # =========================================================================
+    
+    def forward_batched(
+        self,
+        coords: torch.Tensor,
+        frames: torch.Tensor,
+        gt_bz: torch.Tensor,
+        observed_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        pil_mask: Optional[torch.Tensor] = None,
+        scalars: Optional[torch.Tensor] = None,
+        mode: str = "train"
+    ) -> HybridPINNOutput:
+        """
+        OPTIMIZED batched forward pass - processes entire batch at once.
+        
+        Args:
+            coords: [B, T, P, 3] collocation points
+            frames: [B, T, C, H, W] input frames
+            gt_bz: [B, T, P, n_comp] ground truth field
+            observed_mask: [B, T] observation mask
+            labels: [B, n_horizons] flare labels
+            pil_mask: [B, H, W] PIL masks
+            scalars: [B, n_scalars] scalar features
+            mode: "train" or "eval"
+        """
+        device = coords.device
+        B, T, P, _ = coords.shape
+        
+        # Flatten batch dimension for encoder - process all samples together
+        # Encode each sample's frames (can't fully batch due to variable observed frames)
+        # But we can still be smarter by avoiding Python loops where possible
+        
+        all_L = []
+        all_g = []
+        
+        for b in range(B):
+            L_b, g_b = self.encode_frames(frames[b], observed_mask[b])
+            all_L.append(L_b)
+            all_g.append(g_b)
+        
+        L = torch.cat(all_L, dim=0)  # [B, C_latent, H, W]
+        g = torch.cat(all_g, dim=0)  # [B, D_global]
+        
+        # BATCHED field query - this is the main speedup
+        # Flatten coords for batch MLP forward: [B, T, P, 3] -> [B*T*P, 3]
+        coords_flat = coords.reshape(-1, 3).contiguous()
+        coords_flat.requires_grad_(True)
+        
+        # Expand L and g for each point in batch
+        # L: [B, C, H, W] -> need to sample for each of B*T*P points
+        # But points from sample b should use L[b]
+        
+        # Create batch indices for efficient sampling
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, T, P).reshape(-1)
+        
+        # Sample L at all coords in one go (optimized)
+        xy_all = coords_flat[:, :2]  # [B*T*P, 2]
+        xy_batched = xy_all.unsqueeze(1)  # [B*T*P, 1, 2]
+        
+        # Batch sampling using grid_sample - need to handle per-sample L
+        L_sampled_list = []
+        chunk_size = T * P
+        for b in range(B):
+            start = b * chunk_size
+            end = start + chunk_size
+            L_b_sampled = sample_latent_soft_bilinear(
+                L[b:b+1], xy_all[start:end].unsqueeze(0)
+            ).squeeze(0)  # [T*P, C]
+            L_sampled_list.append(L_b_sampled)
+        L_sampled = torch.cat(L_sampled_list, dim=0)  # [B*T*P, C]
+        
+        # Expand g for all points
+        g_expanded = g[batch_idx]  # [B*T*P, D]
+        
+        # Fourier features
+        ff = self.backbone.ff(coords_flat)  # [B*T*P, FF_dim]
+        
+        # ✅ FIX: Add NaN/Inf safety checks before concat (matching backbone.forward)
+        with torch.no_grad():
+            if torch.isnan(L_sampled).any() or torch.isinf(L_sampled).any():
+                L_sampled = torch.nan_to_num(L_sampled, nan=0.0, posinf=1.0, neginf=-1.0)
+        L_sampled = L_sampled.clamp(-10.0, 10.0)
+        
+        with torch.no_grad():
+            if torch.isnan(g_expanded).any() or torch.isinf(g_expanded).any():
+                g_expanded = torch.nan_to_num(g_expanded, nan=0.0, posinf=1.0, neginf=-1.0)
+        g_expanded = g_expanded.clamp(-10.0, 10.0)
+        
+        # Concatenate inputs for MLP
+        z = torch.cat([coords_flat, ff, L_sampled, g_expanded], dim=-1)
+        
+        # Forward through MLP layers with FiLM (now batched!)
+        h = z
+        for i, (layer, act) in enumerate(zip(self.backbone.layers_list, self.backbone.activations), start=1):
+            h = act(layer(h))
+            if i in self.backbone.film_layers:
+                h = self.backbone.film_modules[str(i)](h, g_expanded)
+        
+        out = self.backbone.head(h)
+        
+        # ⚡ SAFETY: Tight clamp on outputs to prevent NaN in physics gradients
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        out = out.clamp(-10.0, 10.0)
+        
+        # Split outputs
+        C = self.n_components
+        A = out[..., :C]
+        B_field = out[..., C:2*C]
+        u = out[..., 2*C:2*C+2]
+        
+        # Reshape for classifier: [B*T*P, C] -> [B, T, P, C]
+        feats_dict = {
+            "A_z": A.reshape(B, T, P, -1),
+            "B_z": B_field.reshape(B, T, P, -1),
+            "u_x": u[..., 0:1].reshape(B, T, P, 1),
+            "u_y": u[..., 1:2].reshape(B, T, P, 1),
+        }
+        
+        if C >= 3:
+            feats_dict["B_x"] = B_field[..., 0:1].reshape(B, T, P, 1)
+            feats_dict["B_y"] = B_field[..., 1:2].reshape(B, T, P, 1)
+            feats_dict["B_z_scalar"] = B_field[..., 2:3].reshape(B, T, P, 1)
+        
+        # BATCHED classification
+        logits = self.classifier(feats_dict, observed_mask, scalars=scalars)  # [B, n_horizons]
+        probs = torch.sigmoid(logits).clamp(0.0, 1.0)
+        
+        # Compute losses (batched)
+        loss_cls = torch.tensor(0.0, device=device)
+        loss_data = torch.tensor(0.0, device=device)
+        loss_phys = torch.tensor(0.0, device=device)
+        ess_val = 0.0
+        
+        # Get initial lambda (from schedule or LRA state)
+        lambda_phys = self.get_lambda_phys()
+        use_lra = getattr(self.cfg.physics, 'use_lra', False) and self.cfg.physics.enable
+        
+        if mode == "train":
+            if labels is not None:
+                loss_cls = self.compute_classification_loss(logits, labels, probs)
+            
+            if gt_bz is not None:
+                loss_data = self.compute_data_loss(
+                    B_field, gt_bz, observed_mask, B, T, P
+                )
+            
+            # Physics loss - compute on multiple samples for better gradient estimation
+            # For LRA/GradNorm, we always compute physics (even with low lambda) to update gradient stats
+            should_compute_phys = (lambda_phys > 0.01 or use_lra) and observed_mask.any()
+            if should_compute_phys:
+                # ✅ FIX: Average physics loss over multiple samples (not just first)
+                # This reduces variance and makes GradNorm more stable
+                n_phys_samples = min(B, 2)  # Use up to 2 samples for physics
+                phys_losses = []
+                for phys_i in range(n_phys_samples):
+                    pil_mask_i = pil_mask[phys_i] if pil_mask is not None else None
+                    coords_i = coords[phys_i].reshape(-1, 3).contiguous()
+                    coords_i.requires_grad_(True)
+                    loss_phys_i, ess_i = self.compute_physics_loss(
+                        coords_i, L[phys_i:phys_i+1], g[phys_i:phys_i+1], pil_mask_i, 1.0
+                    )
+                    phys_losses.append(loss_phys_i)
+                    if phys_i == 0:
+                        ess_val = ess_i
+                
+                # Average physics losses
+                if len(phys_losses) > 1:
+                    loss_phys = sum(phys_losses) / len(phys_losses)
+                else:
+                    loss_phys = phys_losses[0]
+            
+            # LRA: Update adaptive lambda based on gradient norms
+            if use_lra and loss_cls.abs() > 1e-10 and loss_phys.abs() > 1e-10:
+                # Combine data losses for LRA (cls + data)
+                loss_data_combined = loss_cls + loss_data
+                lambda_phys = self.update_lra(loss_data_combined, loss_phys)
+            
+            # ✅ FIXED: Update GradNorm weights in batched path too
+            use_gradnorm = getattr(self.cfg.physics, 'use_gradnorm', False) and self.cfg.physics.enable
+            if use_gradnorm and loss_cls.requires_grad and loss_phys.requires_grad:
+                shared_params = [p for p in self.backbone.parameters() if p.requires_grad]
+                w_cls, w_phys = self.update_gradnorm(loss_cls, loss_phys, shared_params)
+        
+        # Aggregate losses (with updated lambda if LRA, or GradNorm weights if enabled)
+        loss_total = self._aggregate_losses(
+            loss_cls, loss_data, loss_phys, 
+            torch.tensor(0.0, device=device), 
+            lambda_phys, device
+        )
+        
+        # ✅ FIX: Explicit memory cleanup for MPS to prevent leaks
+        del all_L, all_g, L_sampled_list, z, h
+        
+        return HybridPINNOutput(
+            logits=logits,
+            probs=probs,
+            A=A,
+            B=B_field,
+            u=u,
+            loss_cls=loss_cls,
+            loss_data=loss_data,
+            loss_phys=loss_phys,
+            loss_curl=torch.tensor(0.0, device=device),
+            loss_total=loss_total,
+            ess=ess_val,
+            lambda_phys=lambda_phys,
+            fourier_alpha=float(self.backbone.ff._alpha.detach().cpu())
+        )
     
     def forward(
         self,
@@ -667,6 +1517,18 @@ class HybridPINNModel(nn.Module):
         device = coords.device
         T, P = coords.shape[0], coords.shape[1]
         B = 1
+        
+        # FIXED: Input validation to catch NaN/Inf early
+        # Use any() checks to avoid MPS synchronization issues from all()
+        with torch.no_grad():
+            if torch.isnan(coords).any() or torch.isinf(coords).any():
+                coords = torch.nan_to_num(coords, nan=0.0, posinf=1.0, neginf=-1.0)
+            if frames is not None and (torch.isnan(frames).any() or torch.isinf(frames).any()):
+                frames = torch.nan_to_num(frames, nan=0.0, posinf=3.0, neginf=-3.0)
+            if gt_bz is not None and (torch.isnan(gt_bz).any() or torch.isinf(gt_bz).any()):
+                gt_bz = torch.nan_to_num(gt_bz, nan=0.0, posinf=3.0, neginf=-3.0)
+            if scalars is not None and (torch.isnan(scalars).any() or torch.isinf(scalars).any()):
+                scalars = torch.nan_to_num(scalars, nan=0.0, posinf=10.0, neginf=-10.0)
         
         # 1. Encode frames
         has_observed = observed_mask is not None and observed_mask.any()
@@ -690,19 +1552,41 @@ class HybridPINNModel(nn.Module):
         
         # Construct feats_dict for ClassifierHead (which expects specific keys)
         # We map our generic fields to what ClassifierHead expects
+        # For multi-component (3), A_z and B_z contain full field tensors [B,T,P,C]
+        # For single-component (1), they contain scalar fields [B,T,P,1]
         feats_dict = {
-            "A_z": field.A.reshape(B, T, P, -1), # Use full A as features
-            "B_z": field.B.reshape(B, T, P, -1), # Use full B as features
+            "A_z": field.A.reshape(B, T, P, -1),  # [B,T,P,C] where C=n_components
+            "B_z": field.B.reshape(B, T, P, -1),  # [B,T,P,C] where C=n_components
             "u_x": field.u.reshape(B, T, P, -1)[..., 0:1],
             "u_y": field.u.reshape(B, T, P, -1)[..., 1:2],
         }
+        # For physics features, we need individual B components (if 3-component mode)
+        if self.n_components >= 3 and field.B_x is not None and field.B_y is not None:
+            feats_dict["B_x"] = field.B_x.reshape(B, T, P, 1)
+            feats_dict["B_y"] = field.B_y.reshape(B, T, P, 1)
+            # Also provide scalar Bz for PhysicsFeatureExtractor compatibility
+            feats_dict["B_z_scalar"] = field.B_z.reshape(B, T, P, 1)
         
-        # Prepare scalars for classifier (ensure batch dimension)
-        if scalars is not None and scalars.dim() == 1:
-            scalars = scalars.unsqueeze(0)  # [n_scalars] -> [1, n_scalars]
+        # Prepare scalars for classifier (ensure batch dimension and correct size)
+        if scalars is not None:
+            if scalars.dim() == 1:
+                scalars = scalars.unsqueeze(0)  # [n_scalars] -> [1, n_scalars]
+            
+            # SAFETY: Pad/truncate scalars to match classifier expectation
+            expected_dim = self.classifier.n_scalar_features
+            actual_dim = scalars.shape[-1]
+            if actual_dim < expected_dim:
+                pad = torch.zeros(scalars.shape[0], expected_dim - actual_dim, 
+                                  device=scalars.device, dtype=scalars.dtype)
+                scalars = torch.cat([scalars, pad], dim=-1)
+            elif actual_dim > expected_dim:
+                scalars = scalars[..., :expected_dim]
         
         logits = self.classifier(feats_dict, observed_mask.unsqueeze(0), scalars=scalars)
         probs = torch.sigmoid(logits)
+        
+        # Safety: clamp probs to valid range (prevents any floating point weirdness)
+        probs = probs.clamp(0.0, 1.0)
         
         # 4. Compute losses
         loss_cls = torch.tensor(0.0, device=device)
@@ -735,15 +1619,23 @@ class HybridPINNModel(nn.Module):
                     )
             
             # Physics loss
-            has_valid_outputs = (
-                torch.isfinite(field.B).all() and 
-                torch.isfinite(field.u).all()
-            )
+            # FIXED: Use any() for NaN/Inf checks to avoid MPS synchronization issues
+            with torch.no_grad():
+                has_invalid_B = torch.isnan(field.B).any() or torch.isinf(field.B).any()
+                has_invalid_u = torch.isnan(field.u).any() or torch.isinf(field.u).any()
+            has_valid_outputs = not (has_invalid_B or has_invalid_u)
             
             if lambda_phys > 0.01 and has_observed and has_valid_outputs:
                 loss_phys, ess_val = self.compute_physics_loss(
                     coords_flat, L, g, pil_mask, lambda_phys
                 )
+                
+                # ✅ FIXED: Update GradNorm weights (if enabled)
+                # These weights are stored in buffers and applied in _aggregate_losses()
+                if getattr(self.cfg.physics, 'use_gradnorm', False) and loss_cls.requires_grad and loss_phys.requires_grad:
+                    shared_params = [p for p in self.backbone.parameters() if p.requires_grad]
+                    w_cls, w_phys = self.update_gradnorm(loss_cls, loss_phys, shared_params)
+                    # Weights are stored in self._gradnorm_weights and used in _aggregate_losses()
         
         # 5. Aggregate losses
         loss_total = self._aggregate_losses(
@@ -770,5 +1662,6 @@ class HybridPINNModel(nn.Module):
             loss_total=loss_total,
             ess=ess_val,
             lambda_phys=lambda_phys,
-            fourier_alpha=self.backbone.ff._alpha.item()
+            # FIXED: Avoid .item() which can hang on MPS after physics computation
+            fourier_alpha=float(self.backbone.ff._alpha.detach().cpu())
         )

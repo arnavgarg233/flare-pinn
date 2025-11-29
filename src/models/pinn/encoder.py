@@ -29,7 +29,7 @@ class ConvGN(nn.Module):
 
 
 class ResBlock(nn.Module):
-    """Residual block with skip connection."""
+    """Residual block with skip connection and proper initialization."""
     def __init__(self, channels: int, dropout: float = 0.1):
         super().__init__()
         self.conv1 = ConvGN(channels, channels)
@@ -37,6 +37,12 @@ class ResBlock(nn.Module):
         self.norm2 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
         self.dropout = nn.Dropout2d(dropout)
         self.act = nn.SiLU()
+        
+        # Initialize conv2 with smaller weights for stable residual learning
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.conv2.weight, gain=0.1)
+            if self.conv2.bias is not None:
+                nn.init.zeros_(self.conv2.bias)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
@@ -110,6 +116,15 @@ class TemporalAttention(nn.Module):
         
         # Learnable "query" for extracting summary
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        
+        # Initialize projections with Xavier for stable attention
+        with torch.no_grad():
+            for proj in [self.q_proj, self.k_proj, self.v_proj]:
+                nn.init.xavier_uniform_(proj.weight)
+                nn.init.zeros_(proj.bias)
+            # Output projection with smaller weights
+            nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
+            nn.init.zeros_(self.out_proj.bias)
         
     def forward(
         self, 
@@ -281,11 +296,19 @@ class TinyEncoder(nn.Module):
         L = self.proj_L(h)  # [N, latent_channels, H/4, W/4]
         L = F.interpolate(L, size=x.shape[-2:], mode='bilinear', align_corners=False)  # [N, latent_channels, H, W]
         
-        # FIXED: NaN check on outputs
-        if not torch.isfinite(L).all():
-            L = torch.nan_to_num(L, nan=0.0, posinf=1.0, neginf=-1.0)
-        if not torch.isfinite(g).all():
-            g = torch.nan_to_num(g, nan=0.0, posinf=1.0, neginf=-1.0)
+        # FIXED: NaN check on outputs with clamping
+        # Use any() to avoid MPS synchronization issues
+        with torch.no_grad():
+            if torch.isnan(L).any() or torch.isinf(L).any():
+                L = torch.nan_to_num(L, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Clamp L to prevent extreme values that can cause NaN in downstream ops
+        L = L.clamp(-10.0, 10.0)
+        
+        with torch.no_grad():
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                g = torch.nan_to_num(g, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Clamp g to prevent extreme values
+        g = g.clamp(-10.0, 10.0)
         
         return L, g
 
@@ -318,14 +341,16 @@ class TemporalEncoder(nn.Module):
         self.global_dim = global_dim
         self.temporal_dim = temporal_dim
         
-        # Per-frame CNN encoder
+        # Per-frame CNN encoder with proper normalization
         self.frame_encoder = nn.Sequential(
             ConvGN(in_channels, 32),
             ResBlock(32, dropout),
             nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            ConvGN(64, 64),
+            nn.GroupNorm(8, 64),  # Added normalization after strided conv
+            nn.SiLU(),
             ResBlock(64, dropout),
-            nn.Conv2d(64, latent_channels, 1)
+            nn.Conv2d(64, latent_channels, 1),
+            nn.GroupNorm(min(8, latent_channels), latent_channels),  # Added final normalization
         )
         
         # Global pooling for frame features
@@ -334,17 +359,22 @@ class TemporalEncoder(nn.Module):
         # Temporal position encoding
         self.temporal_pe = TemporalPositionEncoding(temporal_dim, max_frames)
         
-        # Project frame features to temporal dim
-        self.frame_proj = nn.Linear(latent_channels, temporal_dim)
+        # Project frame features to temporal dim with LayerNorm for stability
+        self.frame_proj = nn.Sequential(
+            nn.Linear(latent_channels, temporal_dim),
+            nn.LayerNorm(temporal_dim),
+        )
         
         # Temporal attention for aggregation
         self.temporal_attn = TemporalAttention(temporal_dim, n_attn_heads, dropout)
         
-        # Final projections
+        # Final projections with LayerNorm
         self.global_proj = nn.Sequential(
             nn.Linear(temporal_dim, global_dim),
+            nn.LayerNorm(global_dim),
             nn.SiLU(),
-            nn.Linear(global_dim, global_dim)
+            nn.Linear(global_dim, global_dim),
+            nn.LayerNorm(global_dim),
         )
         
         # Spatial map aggregation (weighted by attention)
@@ -357,7 +387,7 @@ class TemporalEncoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            frames: [T, H, W] frame sequence
+            frames: [T, H, W] or [T, C, H, W] frame sequence
             observed_mask: [T] boolean mask for valid frames
             
         Returns:
@@ -365,7 +395,11 @@ class TemporalEncoder(nn.Module):
             g: [1, D] global conditioning code
             temporal_weights: [T] frame importance weights
         """
-        T, H, W = frames.shape
+        # Handle both 3D and 4D input
+        if frames.dim() == 3:
+            T, H, W = frames.shape
+        else:
+            T, C, H, W = frames.shape
         device = frames.device
         
         # Handle empty observation case
@@ -382,11 +416,11 @@ class TemporalEncoder(nn.Module):
         
         # Encode all frames in a single batch (much faster than loop)
         if obs_frames.dim() == 3:
-             # [T_obs, H, W] -> [T_obs, 1, H, W]
-             obs_frames_batch = obs_frames.unsqueeze(1)
+            # [T_obs, H, W] -> [T_obs, 1, H, W]
+            obs_frames_batch = obs_frames.unsqueeze(1)
         else:
-             # [T_obs, C, H, W]
-             obs_frames_batch = obs_frames
+            # [T_obs, C, H, W]
+            obs_frames_batch = obs_frames
         
         # CNN features for all frames at once
         frame_features = self.frame_encoder(obs_frames_batch)  # [T_obs, C, H', W']
@@ -401,9 +435,9 @@ class TemporalEncoder(nn.Module):
         )  # [T_obs, C, H, W]
         
         # Global features per frame
-        global_feats = self.global_pool(frame_features).view(T_obs, C)  # [T_obs, C]
+        global_feats = self.global_pool(frame_features).view(T_obs, -1)  # [T_obs, latent_channels]
         
-        # Project to temporal dim
+        # Project to temporal dim (frame_proj is now a Sequential with LayerNorm)
         temporal_feats = self.frame_proj(global_feats)  # [T_obs, temporal_dim]
         
         # Add position encoding (based on position in observed sequence)
@@ -441,6 +475,18 @@ class TemporalEncoder(nn.Module):
             f"TemporalEncoder output channel mismatch: got {L_out.shape[1]}, expected {expected_channels}"
         assert g.shape[1] == self.global_dim, \
             f"TemporalEncoder global dim mismatch: got {g.shape[1]}, expected {self.global_dim}"
+        
+        # FIXED: NaN/Inf safety checks with clamping
+        # Use any() to avoid MPS synchronization issues
+        with torch.no_grad():
+            if torch.isnan(L_out).any() or torch.isinf(L_out).any():
+                L_out = torch.nan_to_num(L_out, nan=0.0, posinf=1.0, neginf=-1.0)
+        L_out = L_out.clamp(-10.0, 10.0)
+        
+        with torch.no_grad():
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                g = torch.nan_to_num(g, nan=0.0, posinf=1.0, neginf=-1.0)
+        g = g.clamp(-10.0, 10.0)
         
         return L_out, g, full_weights
 
@@ -601,7 +647,9 @@ class TransformerTemporalEncoder(nn.Module):
         
         # Compute frame importance weights from transformer outputs
         frame_attn_logits = self.spatial_attn(frame_outputs).squeeze(-1)  # [1, T_obs]
+        frame_attn_logits = frame_attn_logits.clamp(-50.0, 50.0)  # Prevent softmax overflow
         frame_weights = F.softmax(frame_attn_logits, dim=-1).squeeze(0)  # [T_obs]
+        frame_weights = torch.nan_to_num(frame_weights, nan=1.0/frame_weights.numel())
         
         # Aggregate spatial features using learned weights
         weighted_L = (spatial_features * frame_weights[:, None, None, None]).sum(dim=0, keepdim=True)  # [1, C, H, W]
@@ -928,7 +976,9 @@ class LightweightTemporalEncoder(nn.Module):
         
         # Compute frame importance
         importance_logits = self.frame_importance(gru_out).squeeze(-1)  # [1, T_obs]
+        importance_logits = importance_logits.clamp(-50.0, 50.0)  # Prevent softmax overflow
         frame_weights = F.softmax(importance_logits, dim=-1).squeeze(0)  # [T_obs]
+        frame_weights = torch.nan_to_num(frame_weights, nan=1.0/frame_weights.numel())
         
         # Global code from final hidden state
         g = self.global_proj(hidden.transpose(0, 1).reshape(1, -1))  # [1, global_dim]
@@ -1042,7 +1092,9 @@ class EfficientGRUEncoder(nn.Module):
         
         # Attention weights
         attn_logits = self.attn(gru_out).squeeze(-1)  # [1, T_obs]
+        attn_logits = attn_logits.clamp(-50.0, 50.0)  # Prevent softmax overflow
         weights = F.softmax(attn_logits, dim=-1).squeeze(0)  # [T_obs]
+        weights = torch.nan_to_num(weights, nan=1.0/weights.numel())
         
         # Global code
         g = self.global_proj(gru_out[:, -1, :])  # [1, global_dim]
@@ -1106,11 +1158,17 @@ class PILEvolutionTracker(nn.Module):
         grad_mag = (grad_x ** 2 + grad_y ** 2).sqrt()
         
         # PIL mask: high gradient regions near zero crossings
-        threshold = torch.quantile(grad_mag.flatten(), 1.0 - threshold_pct)
+        # FIXED: Avoid torch.quantile on MPS - use sorted-based approximation
+        grad_sorted = torch.sort(grad_mag.flatten()).values
+        threshold_idx = int((1.0 - threshold_pct) * (grad_sorted.numel() - 1))
+        threshold = grad_sorted[threshold_idx]
         pil_mask = (grad_mag > threshold).float()
         
         # Also require near polarity inversion
-        near_zero = (bz_frame.abs() < bz_frame.abs().quantile(0.3)).float()
+        # FIXED: Avoid torch.quantile on MPS
+        bz_sorted = torch.sort(bz_frame.abs().flatten()).values
+        bz_threshold = bz_sorted[int(0.3 * (bz_sorted.numel() - 1))]
+        near_zero = (bz_frame.abs() < bz_threshold).float()
         pil_mask = pil_mask * near_zero
         
         # Compute statistics

@@ -14,12 +14,23 @@ class FourierFeatures(nn.Module):
     """
     Fourier features for (x,y,t) in [-1,1]^3 with FULL frequency set always computed.
     Call set_alpha(0..1) during training to scale higher frequencies (soft annealing).
+    
+    OPTIMIZED: Pre-registers frequency buffers for faster computation.
+    Output order: [x, sin_f1, cos_f1, sin_f2, cos_f2, ...] (compatible with original)
     """
     def __init__(self, in_dim: int = 3, max_log2_freq: int = 5):
         super().__init__()
         self.in_dim = in_dim
         self.max_log2_freq = max_log2_freq
-        self.register_buffer("_alpha", torch.tensor(1.0))  # Annealing weight
+        self.register_buffer("_alpha", torch.tensor(1.0))
+        
+        # Pre-compute frequencies and register as buffer (faster than recomputing)
+        freqs = torch.tensor([math.pi * (2.0 ** k) for k in range(1, max_log2_freq + 1)])
+        self.register_buffer("_freqs", freqs)  # [max_log2_freq]
+        
+        # Pre-compute weight thresholds for annealing
+        thresholds = torch.tensor([(k-1) / max_log2_freq for k in range(1, max_log2_freq + 1)])
+        self.register_buffer("_thresholds", thresholds)
 
     def set_alpha(self, a: float) -> None:
         """Set annealing parameter (0=soft start, 1=full freqs)"""
@@ -28,15 +39,27 @@ class FourierFeatures(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., in_dim]
-        # Always compute all frequencies, but scale higher ones by alpha
+        # Vectorized Fourier features (much faster than loop)
+        alpha = self._alpha  # Keep as tensor for vectorized ops
+        
+        # Compute weights: clamp((alpha - threshold) * max_log2_freq, 0, 1)
+        weights = ((alpha - self._thresholds) * self.max_log2_freq).clamp(0.0, 1.0)  # [max_log2_freq]
+        
+        # Expand x for broadcasting: [..., in_dim, 1] * [max_log2_freq] -> [..., in_dim, max_log2_freq]
+        x_expanded = x.unsqueeze(-1)  # [..., in_dim, 1]
+        scaled_x = x_expanded * self._freqs  # [..., in_dim, max_log2_freq]
+        
+        # Compute sin and cos features
+        sin_feats = torch.sin(scaled_x) * weights  # [..., in_dim, max_log2_freq]
+        cos_feats = torch.cos(scaled_x) * weights  # [..., in_dim, max_log2_freq]
+        
+        # Collect outputs in original order: [x, sin_f1, cos_f1, sin_f2, cos_f2, ...]
+        # sin_feats[..., k] and cos_feats[..., k] each have shape [..., in_dim]
         outs = [x]
-        alpha = float(self._alpha.item())
-        for k in range(1, self.max_log2_freq + 1):
-            f = 2.0 ** k
-            # Soft annealing: linearly scale frequency contribution
-            weight = min(1.0, max(0.0, (alpha - (k-1)/self.max_log2_freq) * self.max_log2_freq))
-            outs.append(weight * torch.sin(math.pi * f * x))
-            outs.append(weight * torch.cos(math.pi * f * x))
+        for k in range(self.max_log2_freq):
+            outs.append(sin_feats[..., k])  # [..., in_dim]
+            outs.append(cos_feats[..., k])  # [..., in_dim]
+        
         return torch.cat(outs, dim=-1)
 
 def fourier_out_dim(in_dim: int = 3, max_log2_freq: int = 5) -> int:
@@ -45,7 +68,7 @@ def fourier_out_dim(in_dim: int = 3, max_log2_freq: int = 5) -> int:
 # ---------------- Backbone (coordinate MLP) ---------------- #
 
 class ResBlock(nn.Module):
-    """Residual block for deeper gradient flow."""
+    """Residual block for deeper gradient flow with proper initialization."""
     def __init__(self, dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -54,6 +77,14 @@ class ResBlock(nn.Module):
             nn.Linear(dim, dim),
             nn.SiLU(),
         )
+        # Initialize the second linear layer with smaller weights for stable residual
+        # This ensures the residual starts close to identity and learns deviations
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.net[0].weight)
+            nn.init.zeros_(self.net[0].bias)
+            # Scale down the second layer for identity-like initialization
+            nn.init.xavier_uniform_(self.net[2].weight, gain=0.1)
+            nn.init.zeros_(self.net[2].bias)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.net(x)
@@ -69,7 +100,8 @@ def _mlp(in_dim: int, hidden: int, out_dim: int, layers: int) -> nn.Sequential:
         layers: Number of hidden layers (approximate, will be converted to blocks)
     """
     # Input projection
-    mods = [nn.Linear(in_dim, hidden), nn.SiLU()]
+    input_layer = nn.Linear(in_dim, hidden)
+    mods = [input_layer, nn.SiLU()]
     
     # Residual blocks
     # Each block contains 2 layers. 
@@ -81,10 +113,17 @@ def _mlp(in_dim: int, hidden: int, out_dim: int, layers: int) -> nn.Sequential:
     
     # Handle odd number of layers (optional, just to stay close to requested depth)
     if (layers - 1) % 2 != 0:
-        mods.extend([nn.Linear(hidden, hidden), nn.SiLU()])
+        extra_layer = nn.Linear(hidden, hidden)
+        mods.extend([extra_layer, nn.SiLU()])
         
-    # Output projection
-    mods.append(nn.Linear(hidden, out_dim))
+    # Output projection - initialize with small weights for stable starting point
+    output_layer = nn.Linear(hidden, out_dim)
+    with torch.no_grad():
+        # Small output initialization helps with initial gradient flow
+        nn.init.xavier_uniform_(output_layer.weight, gain=0.1)
+        nn.init.zeros_(output_layer.bias)
+    mods.append(output_layer)
+    
     return nn.Sequential(*mods)
 
 
@@ -264,11 +303,18 @@ class SpatialAttentionPool(nn.Module):
     """
     def __init__(self, in_features: int, hidden: int = 64):
         super().__init__()
+        self.hidden = hidden
         self.attn = nn.Sequential(
             nn.Linear(in_features, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1)
         )
+        # Initialize with smaller weights for stable attention
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.attn[0].weight, gain=0.5)
+            nn.init.zeros_(self.attn[0].bias)
+            nn.init.xavier_uniform_(self.attn[2].weight, gain=0.1)
+            nn.init.zeros_(self.attn[2].bias)
         
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -279,9 +325,16 @@ class SpatialAttentionPool(nn.Module):
             pooled: [B, T, C] attention-weighted features
             attn_weights: [B, T, P, 1] attention weights (for visualization)
         """
-        # Compute attention scores
-        scores = self.attn(x)  # [B, T, P, 1]
+        # Compute attention scores and scale by sqrt(hidden) for numerical stability
+        scores = self.attn(x) / (self.hidden ** 0.5)  # [B, T, P, 1]
+        
+        # Softer clamp for better gradient flow
+        scores = scores.clamp(-20.0, 20.0)
+        
         weights = torch.softmax(scores, dim=2)  # Softmax over spatial dim P
+        
+        # Handle potential NaN from softmax (extreme scores)
+        weights = torch.nan_to_num(weights, nan=1.0/x.shape[2], posinf=1.0, neginf=0.0)
         
         # Weighted sum
         pooled = (x * weights).sum(dim=2)  # [B, T, C]
@@ -298,11 +351,18 @@ class TemporalAttentionPool(nn.Module):
     """
     def __init__(self, in_features: int, hidden: int = 64):
         super().__init__()
+        self.hidden = hidden
         self.attn = nn.Sequential(
             nn.Linear(in_features, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1)
         )
+        # Initialize with smaller weights for stable attention
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.attn[0].weight, gain=0.5)
+            nn.init.zeros_(self.attn[0].bias)
+            nn.init.xavier_uniform_(self.attn[2].weight, gain=0.1)
+            nn.init.zeros_(self.attn[2].bias)
         
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -314,8 +374,8 @@ class TemporalAttentionPool(nn.Module):
             pooled: [B, C] attention-weighted features
             attn_weights: [B, T, 1] attention weights
         """
-        # Compute attention scores
-        scores = self.attn(x)  # [B, T, 1]
+        # Compute attention scores with scaling for numerical stability
+        scores = self.attn(x) / (self.hidden ** 0.5)  # [B, T, 1]
         
         # Mask unobserved frames with large negative value
         mask_expanded = mask.unsqueeze(-1)  # [B, T, 1]
@@ -372,16 +432,29 @@ class PhysicsFeatureExtractor(nn.Module):
     def forward(self, feats: dict[str, torch.Tensor], observed_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            feats: dict with A_z, B_z, u_x, u_y each [B, T, P, 1]
+            feats: dict with A_z, B_z, u_x, u_y each [B, T, P, C] where C can be 1 or 3
+                   For 3-component mode, also expects B_x, B_y, B_z_scalar
             observed_mask: [B, T] boolean mask
             
         Returns:
             physics_features: [B, n_features] physics-derived features
         """
-        B_z = feats["B_z"]
+        # For physics features, prefer scalar Bz if available (more meaningful stats)
+        # B_z_scalar is provided in 3-component mode with the actual Bz component
+        if "B_z_scalar" in feats:
+            B_z = feats["B_z_scalar"]  # [B, T, P, 1] - actual Bz component
+        else:
+            B_z = feats["B_z"]  # [B, T, P, C] - may be multi-component
+            # If multi-component, take last component as Bz (convention: [Bx, By, Bz])
+            if B_z.shape[-1] > 1:
+                B_z = B_z[..., -1:]  # Extract Bz as [B, T, P, 1]
+        
         u_x = feats["u_x"]
         u_y = feats["u_y"]
         A_z = feats["A_z"]
+        # If A_z is multi-component, take last component (Az for 2.5D)
+        if A_z.shape[-1] > 1:
+            A_z = A_z[..., -1:]
         
         B, T, P, _ = B_z.shape
         mask_float = observed_mask[..., None, None].float()  # [B, T, 1, 1]
@@ -390,8 +463,12 @@ class PhysicsFeatureExtractor(nn.Module):
         # 1. Field magnitude statistics
         # FIXED: Use where() to avoid 0*Inf=NaN
         B_z_masked = torch.where(mask_bool, B_z, torch.zeros_like(B_z))
-        # FIXED: valid_count must account for spatial points P to avoid scaling issues
-        valid_count = (mask_float.sum(dim=(1, 2, 3)) * P + 1e-8)
+        # FIXED: valid_count = sum of mask values (each is 1 for valid, 0 for invalid)
+        # mask_float is [B, T, 1, 1], sum over T gives count of valid timesteps
+        # Multiply by P since each valid timestep contributes P spatial points
+        n_valid_timesteps = mask_float.sum(dim=(1, 2, 3)).clamp(min=1.0)  # [B]
+        valid_count = n_valid_timesteps * P  # [B] - total valid spatial-temporal points
+        valid_count = valid_count.clamp(min=1.0)  # Safety
         
         # Mean
         bz_mean = B_z_masked.sum(dim=(1, 2, 3)) / valid_count
@@ -399,7 +476,7 @@ class PhysicsFeatureExtractor(nn.Module):
         # Stable variance: E[(X - mean)^2]
         bz_centered = torch.where(mask_bool, B_z - bz_mean.view(B, 1, 1, 1), torch.zeros_like(B_z))
         bz_var = (bz_centered ** 2).sum(dim=(1, 2, 3)) / valid_count
-        bz_std = bz_var.clamp(min=1e-8).sqrt()
+        bz_std = bz_var.clamp(min=1e-6).sqrt()  # Increased epsilon for stability
         
         # Max (absolute)
         # Use where to set masked values to -inf for max
@@ -421,12 +498,14 @@ class PhysicsFeatureExtractor(nn.Module):
         polarity_balance = (bz_pos * bz_neg).sqrt()  # High when balanced = PIL present
         
         # 3. Flow statistics
-        u_mag = (u_x ** 2 + u_y ** 2 + 1e-8).sqrt()  # Add eps before sqrt
+        # FIXED: Use clamp before sqrt to ensure non-negative input
+        u_sq = (u_x ** 2 + u_y ** 2).clamp(min=1e-12)
+        u_mag = u_sq.sqrt()
         u_masked = torch.where(mask_bool, u_mag, torch.zeros_like(u_mag))
         
         u_mean = u_masked.sum(dim=(1, 2, 3)) / valid_count
         
-        u_for_max = torch.where(mask_bool, u_mag, torch.tensor(-1e9, device=u_mag.device))
+        u_for_max = torch.where(mask_bool, u_mag, torch.full_like(u_mag, -1e9))
         u_max = u_for_max.reshape(B, -1).max(dim=1)[0].clamp(min=0.0)
         
         # 4. Flux transport: correlation of flow with field gradient
@@ -475,26 +554,29 @@ class PhysicsFeatureExtractor(nn.Module):
             B_x = feats["B_x"]
             B_y = feats["B_y"]
             
-            # Horizontal field magnitude
-            bh_mag = (B_x**2 + B_y**2 + 1e-8).sqrt()
+            # Horizontal field magnitude - FIXED: clamp before sqrt
+            bh_sq = (B_x**2 + B_y**2).clamp(min=1e-12)
+            bh_mag = bh_sq.sqrt()
             bh_masked = torch.where(mask_bool, bh_mag, torch.zeros_like(bh_mag))
             bh_mean = bh_masked.sum(dim=(1, 2, 3)) / valid_count
             
-            # Total field magnitude  
-            btot_mag = (B_x**2 + B_y**2 + B_z**2 + 1e-8).sqrt()
+            # Total field magnitude - FIXED: clamp before sqrt  
+            btot_sq = (B_x**2 + B_y**2 + B_z**2).clamp(min=1e-12)
+            btot_mag = btot_sq.sqrt()
             btot_masked = torch.where(mask_bool, btot_mag, torch.zeros_like(btot_mag))
             btot_mean = btot_masked.sum(dim=(1, 2, 3)) / valid_count
             
             # 8. Shear angle proxy: angle between horizontal field and potential field
             # For a potential field, B would be nearly vertical at PIL
             # Shear = Bh / Btot (high shear = more non-potential = flare prone)
-            shear_proxy = bh_mag / (btot_mag + 1e-8)
+            # FIXED: Increase epsilon for division stability
+            shear_proxy = bh_mag / btot_mag.clamp(min=1e-6)
             shear_masked = torch.where(mask_bool, shear_proxy, torch.zeros_like(shear_proxy))
             shear_mean = shear_masked.sum(dim=(1, 2, 3)) / valid_count
             
             # 9. Free energy proxy: E_free ∝ Bh² (excess over potential field)
             # This is a key predictor of flare energy
-            free_energy_proxy = bh_mag ** 2
+            free_energy_proxy = bh_sq  # Already computed, avoid recomputing bh_mag ** 2
             fe_masked = torch.where(mask_bool, free_energy_proxy, torch.zeros_like(free_energy_proxy))
             free_energy_mean = fe_masked.sum(dim=(1, 2, 3)) / valid_count
         else:
@@ -507,7 +589,9 @@ class PhysicsFeatureExtractor(nn.Module):
         # High kurtosis indicates non-Gaussian, complex field configurations
         bz_4th = torch.where(mask_bool, B_z ** 4, torch.zeros_like(B_z))
         bz_4th_mean = bz_4th.sum(dim=(1, 2, 3)) / valid_count
-        kurtosis_proxy = bz_4th_mean / (bz_var ** 2 + 1e-8)
+        # FIXED: Increase epsilon and clamp bz_var to avoid division by tiny values
+        bz_var_safe = bz_var.clamp(min=1e-6)
+        kurtosis_proxy = bz_4th_mean / (bz_var_safe ** 2 + 1e-4)
         
         # SOTA: Current helicity proxy (if we have horizontal field)
         # Hc = Jz * Bz where Jz ≈ curl(B)_z = ∂By/∂x - ∂Bx/∂y
@@ -516,8 +600,10 @@ class PhysicsFeatureExtractor(nn.Module):
             B_x = feats["B_x"]
             B_y = feats["B_y"]
             # Twist proxy: |Bh| * |Bz| correlation (high for helical fields)
-            bh_mag = (B_x**2 + B_y**2 + 1e-8).sqrt()
-            twist_proxy = torch.where(mask_bool, bh_mag * B_z.abs(), torch.zeros_like(bh_mag))
+            # FIXED: Reuse bh_mag from above if available, else compute safely
+            bh_sq_helicity = (B_x**2 + B_y**2).clamp(min=1e-12)
+            bh_mag_helicity = bh_sq_helicity.sqrt()
+            twist_proxy = torch.where(mask_bool, bh_mag_helicity * B_z.abs(), torch.zeros_like(bh_mag_helicity))
             current_helicity_proxy = twist_proxy.sum(dim=(1, 2, 3)) / valid_count
         else:
             current_helicity_proxy = torch.zeros_like(bz_mean)
@@ -551,8 +637,9 @@ class PhysicsFeatureExtractor(nn.Module):
             bh_mean, btot_mean, shear_mean, free_energy_mean, current_helicity_proxy
         ], dim=-1)  # [B, 18]
         
-        # Handle any NaN that might occur
-        physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Handle any NaN that might occur - use smaller bounds
+        physics_feats = torch.nan_to_num(physics_feats, nan=0.0, posinf=100.0, neginf=-100.0)
+        physics_feats = physics_feats.clamp(-100.0, 100.0)
         
         return physics_feats
 
@@ -587,6 +674,7 @@ class ClassifierHead(nn.Module):
     - MC Dropout for uncertainty quantification
     - Enhanced feature aggregation
     - RF-guided physics feature weighting
+    - Dynamic feature dimension handling for multi-component fields
     """
     def __init__(
         self, 
@@ -599,6 +687,7 @@ class ClassifierHead(nn.Module):
         n_scalar_features: int = 4,
         mc_dropout: bool = False,
         mc_dropout_rate: float = 0.2,
+        n_field_components: int = 1,  # NEW: Support multi-component fields
     ):
         super().__init__()
         self.horizons = tuple(horizons)
@@ -606,9 +695,12 @@ class ClassifierHead(nn.Module):
         self.use_physics_features = use_physics_features
         self.n_scalar_features = n_scalar_features
         self.mc_dropout_enabled = mc_dropout
+        self.n_field_components = n_field_components
         
-        # Base features: A_z, B_z, u_x, u_y
-        base_features = 4
+        # Base features: A (n_comp) + B (n_comp) + u_x (1) + u_y (1)
+        # For 1-component: A_z(1) + B_z(1) + u_x(1) + u_y(1) = 4
+        # For 3-component: A(3) + B(3) + u_x(1) + u_y(1) = 8
+        base_features = n_field_components * 2 + 2
         
         # Spatial attention pooling
         if use_attention:
@@ -635,8 +727,8 @@ class ClassifierHead(nn.Module):
         
         # Compute total input features for final MLP
         # With attention: pooled(4) + mean(4) + std(4) + max(4) = 16
-        # Plus physics features (9) + scalar features (hidden//4) = 25 + scalar_out
-        # Without attention: mean(4) + std(4) + physics_features(9) + scalar = 17 + scalar_out
+        # Plus physics features (18) + scalar features (hidden//4) = 34 + scalar_out
+        # Without attention: mean(4) + std(4) + physics_features(18) + scalar = 26 + scalar_out
         if use_attention:
             mlp_input = base_features * 4 + physics_features + scalar_out_dim
         else:
@@ -662,19 +754,29 @@ class ClassifierHead(nn.Module):
             self.scalar_proj = None
         
         # Final classifier MLP with residual
+        pre_mlp_linear = nn.Linear(mlp_input, hidden)
         self.pre_mlp = nn.Sequential(
-            nn.Linear(mlp_input, hidden),
+            pre_mlp_linear,
             nn.LayerNorm(hidden),
             nn.SiLU(),
             drop_cls(dropout),
         )
         
+        hidden1 = nn.Linear(hidden, hidden // 2)
+        output_linear = nn.Linear(hidden // 2, len(horizons))
         self.classifier = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
+            hidden1,
             nn.SiLU(),
             drop_cls(dropout),
-            nn.Linear(hidden // 2, len(horizons))
+            output_linear
         )
+        
+        # Initialize classifier output layer with small weights for balanced predictions
+        with torch.no_grad():
+            nn.init.xavier_uniform_(output_linear.weight, gain=0.1)
+            # Initialize bias slightly negative for rare event prediction
+            # This helps with class imbalance by starting with low positive predictions
+            output_linear.bias.fill_(-1.0)
         
         # Store dropout layers for MC mode toggling
         # FIXED: Collect from ALL submodules including scalar_proj
@@ -742,7 +844,8 @@ class ClassifierHead(nn.Module):
             logits: [B, n_horizons] classification logits
         """
         # Concatenate base features
-        X = torch.cat([feats["A_z"], feats["B_z"], feats["u_x"], feats["u_y"]], dim=-1)  # [B,T,P,4]
+        # Shape depends on n_field_components: [B,T,P,4] for 1-comp, [B,T,P,8] for 3-comp
+        X = torch.cat([feats["A_z"], feats["B_z"], feats["u_x"], feats["u_y"]], dim=-1)
         B, T, P, C = X.shape
         
         # Ensure mask has batch dimension
@@ -754,41 +857,46 @@ class ClassifierHead(nn.Module):
             X_spatial, spatial_weights = self.spatial_attn(X)  # [B, T, 4]
             
             # Temporal attention pooling
-            X_pooled, temporal_weights = self.temporal_attn(X_spatial, observed_mask)  # [B, 4]
+            X_pooled, temporal_weights = self.temporal_attn(X_spatial, observed_mask)  # [B, C]
             
             # IMPROVED: Compute comprehensive statistics for better feature representation
             mask_expanded = observed_mask[..., None, None].float()  # [B, T, 1, 1]
             X_masked = X * mask_expanded
-            # FIXED: valid_count must account for spatial points P to avoid scaling issues
-            valid_count = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0) * P  # [B, 1]
+            # FIXED: valid_count = (# valid timesteps) * P spatial points
+            n_valid_t = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0)  # [B, 1]
+            valid_count = n_valid_t * P  # [B, 1]
+            valid_count = valid_count.clamp(min=1.0)  # Safety clamp
             
             # Mean
-            X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, 4]
+            X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, C]
             
             # Standard deviation (more informative than just mean)
             X_sq = (X_masked ** 2).sum(dim=(1, 2)) / valid_count
             X_var = (X_sq - X_mean ** 2).clamp(min=1e-8)
-            X_std = X_var.sqrt()  # [B, 4]
+            X_std = X_var.sqrt()  # [B, C]
             
             # Max absolute value (captures peak activity)
             # Set masked values to large negative so they don't affect max
             X_for_max = X.abs() * mask_expanded + (1 - mask_expanded) * (-1e9)
-            X_max = X_for_max.max(dim=2)[0].max(dim=1)[0]  # [B, 4]
+            X_max = X_for_max.max(dim=2)[0].max(dim=1)[0]  # [B, C]
             
-            # Combine: attention pooled + mean + std + max = 16 features
-            combined = torch.cat([X_pooled, X_mean, X_std, X_max], dim=-1)  # [B, 16]
+            # Combine: attention pooled + mean + std + max = 4*C features
+            combined = torch.cat([X_pooled, X_mean, X_std, X_max], dim=-1)  # [B, 4*base_features]
         else:
             # Improved fallback with mean + std statistics
-            mask_expanded = observed_mask[..., None, None].float()
+            mask_expanded = observed_mask[..., None, None].float()  # [B, T, 1, 1]
             X_masked = X * mask_expanded
-            valid_count = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0)
+            # FIXED: valid_count = (# valid timesteps) * P spatial points
+            n_valid_t = mask_expanded.sum(dim=(1, 2)).clamp(min=1.0)  # [B, 1]
+            valid_count = n_valid_t * P  # [B, 1]
+            valid_count = valid_count.clamp(min=1.0)
             
-            X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, 4]
+            X_mean = X_masked.sum(dim=(1, 2)) / valid_count  # [B, C]
             X_sq = (X_masked ** 2).sum(dim=(1, 2)) / valid_count
             X_var = (X_sq - X_mean ** 2).clamp(min=1e-8)
-            X_std = X_var.sqrt()  # [B, 4]
+            X_std = X_var.sqrt()  # [B, C]
             
-            combined = torch.cat([X_mean, X_std], dim=-1)  # [B, 8]
+            combined = torch.cat([X_mean, X_std], dim=-1)  # [B, 2*C]
         
         # Physics features
         if self.use_physics_features:
@@ -802,19 +910,44 @@ class ClassifierHead(nn.Module):
         
         # Scalar features (R-value, GWPIL, observation coverage, etc.)
         if self.scalar_proj is not None and scalars is not None:
-            # Normalize scalars for stability (log-transform large values)
+            # ✅ FIX #18: Normalize ALL scalar features for stability
+            # Feature layout (16 features):
+            #   0: r_value (log-scale, ~0-10) - already normalized
+            #   1: gwpil (can be large) - needs log1p
+            #   2: obs_coverage (0-1) - already normalized
+            #   3: frame_count (0-48+) - needs normalization
+            #   4-11: PIL evolution (various scales) - needs log1p for large values
+            #   12-15: temporal stats (various scales) - needs log1p for large values
             scalars_safe = scalars.clone()
-            # R-value is already log-scale, GWPIL can be large
-            # Apply log1p to GWPIL (index 1) if it's large
-            if scalars_safe.shape[-1] > 1:
-                scalars_safe[:, 1] = torch.log1p(scalars_safe[:, 1].abs()) * torch.sign(scalars_safe[:, 1])
+            n_feats = scalars_safe.shape[-1]
+            
+            # Log-transform features that can be large (indices 1, 3, and 4+)
+            # Apply log1p with sign preservation for all features except r_value (0) and obs_coverage (2)
+            for idx in [1, 3] + list(range(4, min(n_feats, 16))):
+                if idx < n_feats:
+                    scalars_safe[:, idx] = torch.log1p(scalars_safe[:, idx].abs()) * torch.sign(scalars_safe[:, idx])
+            
+            # Clamp to prevent extreme values
+            scalars_safe = scalars_safe.clamp(-20.0, 20.0)
             
             scalar_feats = self.scalar_proj(scalars_safe)  # [B, hidden//4]
             combined = torch.cat([combined, scalar_feats], dim=-1)
         
+        # NaN/Inf safety: clamp combined features before MLP
+        # Use any() to avoid MPS synchronization issues
+        with torch.no_grad():
+            if torch.isnan(combined).any() or torch.isinf(combined).any():
+                combined = torch.nan_to_num(combined, nan=0.0, posinf=10.0, neginf=-10.0)
+        combined = combined.clamp(-100.0, 100.0)
+        
         # MLP classifier
         h = self.pre_mlp(combined)
+        
         logits = self.classifier(h)
+        
+        # Softer clamp on logits to allow confident predictions
+        # sigmoid(-15) ≈ 3e-7, sigmoid(15) ≈ 0.9999997 - enough range for confident predictions
+        logits = logits.clamp(-15.0, 15.0)
         
         return logits  # [B, n_horizons]
 

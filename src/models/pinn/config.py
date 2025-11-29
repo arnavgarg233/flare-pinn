@@ -147,9 +147,64 @@ class PhysicsConfig(BaseModel):
     )
     
     # SOTA: Advanced physics options
+    # ⚠️  IMPORTANT: use_uncertainty_weighting and use_gradnorm are MUTUALLY EXCLUSIVE!
+    # - use_uncertainty_weighting: Per-component learned weights within physics (Kendall et al. 2018)
+    # - use_gradnorm: Per-task balancing (cls vs physics) via gradient norms (Chen et al. 2018)
+    # If both enabled, use_gradnorm takes precedence and disables uncertainty weighting.
     use_uncertainty_weighting: bool = Field(
-        default=True,
-        description="Use learned uncertainty weighting for automatic loss balancing (Kendall et al. 2018)"
+        default=False,  # FIXED: Changed default to False - prefer GradNorm for multi-task
+        description="Use learned uncertainty weighting for physics component balancing (Kendall et al. 2018). Disabled when use_gradnorm=True."
+    )
+    
+    # LRA: Learning Rate Annealing (Wang et al. 2021)
+    use_lra: bool = Field(
+        default=False,
+        description="Use Learning Rate Annealing for automatic physics/data gradient balancing"
+    )
+    lra_alpha: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description="LRA moving average coefficient for gradient statistics"
+    )
+    lra_update_freq: int = Field(
+        default=1,
+        ge=1,
+        description="How often to update LRA weights (every N steps)"
+    )
+    
+    # GradNorm: Gradient Normalization (Chen et al. 2018)
+    # More principled than LRA - balances gradient scales across tasks
+    use_gradnorm: bool = Field(
+        default=False,
+        description="Use GradNorm for multi-task gradient balancing (better than LRA)"
+    )
+    gradnorm_alpha: float = Field(
+        default=1.5,
+        ge=0.0,
+        le=3.0,
+        description="GradNorm restoring force (α): higher = stronger equalization"
+    )
+    gradnorm_update_freq: int = Field(
+        default=5,
+        ge=1,
+        description="How often to update GradNorm weights (every N steps)"
+    )
+    
+    # Causal Training: Temporal weighting for time-dependent PDEs
+    # ⚠️  There are TWO causal mechanisms - only use ONE at a time:
+    #   1. use_causal_training: Weights collocation points BEFORE physics (in hybrid_model.py)
+    #   2. use_causal_weighting: Weights residuals AFTER physics (in physics.py)
+    # Using both will cause double-weighting! Prefer use_causal_training for stability.
+    use_causal_training: bool = Field(
+        default=False,
+        description="Weight collocation points by temporal causality BEFORE physics computation. Earlier times (t≈0) get higher weight. Mutually exclusive with use_causal_weighting!"
+    )
+    causal_decay: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=10.0,
+        description="Exponential decay rate for use_causal_training: w(t) = exp(-decay * t_norm). Higher = stronger early-time preference."
     )
     enforce_force_free: bool = Field(
         default=False,
@@ -162,15 +217,18 @@ class PhysicsConfig(BaseModel):
         description="Weight for force-free constraint"
     )
 
-    # SOTA: Causal Training (Wang et al., 2022)
-    # Respects temporal causality in PDE solving
+    # SOTA: Causal Weighting (Wang et al., 2022) - Alternative approach
+    # ⚠️  This is DIFFERENT from use_causal_training above!
+    # use_causal_weighting: Weights residuals AFTER physics computation based on cumulative loss
+    # use_causal_training: Weights collocation points BEFORE physics (simpler, more stable)
+    # Only use ONE of these, not both!
     use_causal_weighting: bool = Field(
         default=False,
-        description="Enable causal weighting to enforce time-directionality in physics loss"
+        description="Weight residuals AFTER physics computation based on cumulative loss at earlier times. Mutually exclusive with use_causal_training! Prefer use_causal_training for stability."
     )
     causal_tol: float = Field(
         default=1.0,
-        description="Tolerance parameter for causal weighting"
+        description="Tolerance parameter for use_causal_weighting: w(t) = exp(-tol * cumsum_loss(<t)). Higher = stronger early-time preference."
     )
     
     # Gradient stability
@@ -205,6 +263,12 @@ class PhysicsConfig(BaseModel):
         description="Reduced collocation points during physics warmup (memory optimization)"
     )
     
+    # MPS physics mode: create_graph=False is more stable on MPS (avoids hangs)
+    mps_fast_physics: bool = Field(
+        default=True,
+        description="On MPS, disable create_graph in autograd for stability. Set True to avoid hangs."
+    )
+    
     @field_validator('lambda_phys_schedule')
     @classmethod
     def validate_schedule(cls, v: list[list[float]]) -> list[list[float]]:
@@ -223,6 +287,37 @@ class PhysicsConfig(BaseModel):
         if isinstance(v, list):
             return tuple(v)
         return v
+    
+    @model_validator(mode='after')
+    def validate_physics_conflicts(self) -> PhysicsConfig:
+        """Validate physics configuration for conflicting options."""
+        import warnings
+        
+        # Check causal training conflict
+        if self.use_causal_training and self.use_causal_weighting:
+            raise ValueError(
+                "Cannot use both use_causal_training and use_causal_weighting! "
+                "use_causal_training weights collocation points BEFORE physics (recommended). "
+                "use_causal_weighting weights residuals AFTER physics. "
+                "Using both causes double-weighting. Set one to False."
+            )
+        
+        # GradNorm takes precedence over uncertainty weighting - just warn
+        if self.use_gradnorm and self.use_uncertainty_weighting:
+            warnings.warn(
+                "Both use_gradnorm and use_uncertainty_weighting are enabled. "
+                "GradNorm will handle task-level balancing; uncertainty weighting in physics module is redundant."
+            )
+        
+        # LRA and GradNorm are MUTUALLY EXCLUSIVE - raise error
+        if self.use_lra and self.use_gradnorm:
+            raise ValueError(
+                "Cannot enable both use_lra and use_gradnorm! "
+                "They are mutually exclusive loss balancing mechanisms. "
+                "Use GradNorm for multi-task learning (recommended) or LRA for gradient magnitude balancing."
+            )
+        
+        return self
 
 
 class EtaConfig(BaseModel):
@@ -251,6 +346,23 @@ class CollocationConfig(BaseModel):
     alpha_start: float = Field(default=0.5, ge=0.0, le=1.0, description="Initial PIL bias weight")
     alpha_end: float = Field(default=0.8, ge=0.0, le=1.0, description="Final PIL bias weight")
     impw_clip_quantile: float = Field(default=0.99, ge=0.5, le=0.999, description="Importance weight clipping quantile")
+    
+    # Adaptive Resampling (Residual-based RAR - McClenny & Braga-Neto 2020)
+    use_adaptive_resampling: bool = Field(
+        default=False,
+        description="Resample collocation points based on physics residual magnitude"
+    )
+    adaptive_resample_freq: int = Field(
+        default=10,
+        ge=1,
+        description="How often to update collocation distribution (every N steps)"
+    )
+    adaptive_keep_ratio: float = Field(
+        default=0.3,
+        ge=0.1,
+        le=0.8,
+        description="Fraction of highest-residual points to keep (rest resampled uniformly)"
+    )
     
     @model_validator(mode='after')
     def validate_alpha_progression(self) -> CollocationConfig:
@@ -343,8 +455,11 @@ class DataConfig(BaseModel):
     )
     
     # SOTA: Additional feature engineering
+    # NOTE: use_previous_flare_activity is disabled by default because
+    # ConsolidatedWindowsDataset does NOT compute these features yet.
+    # Enable only if you implement the feature computation in the dataset.
     use_previous_flare_activity: bool = Field(
-        default=True,
+        default=False,  # FIXED: Was True but features weren't computed, causing dimension mismatch!
         description="Include previous flare activity (24h, 48h, 72h lookback) as features"
     )
     use_pil_evolution: bool = Field(

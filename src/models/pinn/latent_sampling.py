@@ -108,5 +108,12 @@ def sample_latent_soft_bilinear(L: torch.Tensor, xy_norm: torch.Tensor) -> torch
     # Weighted sum
     out = (w00.unsqueeze(-1) * v00 + w01.unsqueeze(-1) * v01 +
            w10.unsqueeze(-1) * v10 + w11.unsqueeze(-1) * v11)   # [N,P,C]
+    
+    # FIXED: Handle NaN/Inf that can occur from extreme L values
+    # Use any() to avoid MPS synchronization issues
+    with torch.no_grad():
+        if torch.isnan(out).any() or torch.isinf(out).any():
+            out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     return out
 

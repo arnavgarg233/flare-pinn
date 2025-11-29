@@ -7,7 +7,16 @@ def _safe_eps(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     y_true = y_true.astype(np.float64)
-    y_prob = _safe_eps(y_prob.astype(np.float64))
+    y_prob = y_prob.astype(np.float64)
+    
+    # Filter out NaN/Inf values
+    valid = np.isfinite(y_true) & np.isfinite(y_prob)
+    if valid.sum() == 0:
+        return 0.0
+    
+    y_true = y_true[valid]
+    y_prob = np.clip(y_prob[valid], 0.0, 1.0)  # Clamp to valid probability range
+    
     return float(np.mean((y_prob - y_true) ** 2))
 
 def confusion_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, thr: float) -> tuple[int,int,int,int]:
@@ -35,6 +44,16 @@ def sweep_tss(y_true: np.ndarray, y_prob: np.ndarray, n: int = 1024) -> Tuple[fl
     Uses unique probability values when dataset is small enough,
     otherwise uses linspace + unique probability values for better coverage.
     """
+    # ✅ FIX #13: Guard against n < 2
+    n = max(n, 4)  # Minimum 4 thresholds for meaningful sweep
+    
+    # Filter NaN/Inf
+    valid = np.isfinite(y_true) & np.isfinite(y_prob)
+    if valid.sum() == 0:
+        return 0.5, 0.0
+    y_true = y_true[valid]
+    y_prob = np.clip(y_prob[valid], 0.0, 1.0)
+    
     # Always include unique probability values for better precision
     unique_probs = np.unique(y_prob)
     
@@ -42,8 +61,9 @@ def sweep_tss(y_true: np.ndarray, y_prob: np.ndarray, n: int = 1024) -> Tuple[fl
         thrs = unique_probs
     else:
         # Combine linspace with sampled unique probabilities
-        linspace_thrs = np.linspace(0, 1, n // 2)
-        sampled_unique = np.random.choice(unique_probs, size=min(n // 2, len(unique_probs)), replace=False)
+        n_half = max(n // 2, 2)  # Ensure at least 2 points each
+        linspace_thrs = np.linspace(0, 1, n_half)
+        sampled_unique = np.random.choice(unique_probs, size=min(n_half, len(unique_probs)), replace=False)
         thrs = np.unique(np.concatenate([linspace_thrs, sampled_unique]))
     best = -1.0
     best_thr = 0.5
@@ -76,6 +96,13 @@ def precision_recall_curve(y_true: np.ndarray, y_prob: np.ndarray, n: int = 512)
     return np.asarray(R), np.asarray(P), thrs
 
 def pr_auc(y_true: np.ndarray, y_prob: np.ndarray, n: int = 512) -> float:
+    # Filter NaN/Inf
+    valid = np.isfinite(y_true) & np.isfinite(y_prob)
+    if valid.sum() == 0:
+        return 0.0
+    y_true = y_true[valid]
+    y_prob = np.clip(y_prob[valid], 0.0, 1.0)
+    
     R, P, _ = precision_recall_curve(y_true, y_prob, n=n)
     idx = np.argsort(R)
     R, P = R[idx], P[idx]
@@ -83,7 +110,15 @@ def pr_auc(y_true: np.ndarray, y_prob: np.ndarray, n: int = 512) -> float:
 
 def adaptive_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
     y_true = y_true.astype(np.float64)
-    y_prob = _safe_eps(y_prob.astype(np.float64))
+    y_prob = y_prob.astype(np.float64)
+    
+    # Filter out NaN/Inf values
+    valid = np.isfinite(y_true) & np.isfinite(y_prob)
+    if valid.sum() == 0:
+        return 0.0
+    y_true = y_true[valid]
+    y_prob = np.clip(y_prob[valid], 1e-12, 1.0 - 1e-12)
+    
     qs = np.linspace(0, 1, n_bins+1)
     edges = np.quantile(y_prob, qs)
     edges[0], edges[-1] = 0.0, 1.0

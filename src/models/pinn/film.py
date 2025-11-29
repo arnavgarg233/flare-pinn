@@ -24,11 +24,15 @@ class FiLM(nn.Module):
         # Predict both scale (gamma) and shift (beta)
         self.mlp = nn.Linear(code_dim, hidden_dim * 2)
         
-        # Initialize with identity-like behavior
+        # FIXED: Initialize with small random weights (NOT zero!) for gradient flow
+        # and correct biases for identity modulation at initialization
         with torch.no_grad():
-            self.mlp.weight.fill_(0.0)
-            self.mlp.bias[:hidden_dim].fill_(1.0)  # gamma = 1
-            self.mlp.bias[hidden_dim:].fill_(0.0)  # beta = 0
+            # Small random weights so gradients can flow through conditioning
+            nn.init.normal_(self.mlp.weight, mean=0.0, std=0.02)
+            # gamma_raw = 0 → tanh(0)*2+1 = 1.0 (identity scale)
+            self.mlp.bias[:hidden_dim].fill_(0.0)
+            # beta = 0 (no shift)
+            self.mlp.bias[hidden_dim:].fill_(0.0)
     
     def forward(self, h: torch.Tensor, code: torch.Tensor) -> torch.Tensor:
         """
@@ -39,11 +43,24 @@ class FiLM(nn.Module):
         Returns:
             modulated: [N, hidden_dim] - FiLM-modulated activations
         """
+        # Handle NaN/Inf in inputs - use any() to avoid MPS sync issues
+        with torch.no_grad():
+            if torch.isnan(code).any() or torch.isinf(code).any():
+                code = torch.nan_to_num(code, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         gam_beta = self.mlp(code)  # [N, 2*hidden_dim]
-        gamma, beta = gam_beta.chunk(2, dim=-1)
+        gamma_raw, beta = gam_beta.chunk(2, dim=-1)
         
-        # Optional: clamp gamma to prevent instability
-        gamma = torch.tanh(gamma) * 2.0 + 1.0  # Range: [-1, 3]
+        # FIXED: Softer gamma transformation for better gradient flow
+        # tanh(x) * 0.5 + 1.0 gives range [0.5, 1.5] centered at 1.0
+        # This prevents extreme scaling while allowing modulation
+        gamma = torch.tanh(gamma_raw) * 0.5 + 1.0
         
-        return gamma * h + beta
+        # Clamp beta to prevent extreme shifts (but less aggressive)
+        beta = beta.clamp(-5.0, 5.0)
+        
+        result = gamma * h + beta
+        
+        # Softer output clamping (let gradients flow better)
+        return result.clamp(-100.0, 100.0)
 

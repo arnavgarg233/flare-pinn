@@ -1,0 +1,167 @@
+# =============================================================================
+# SOTA CONFIG - 24H HORIZON ONLY (TSS > 0.80 TARGET)
+# =============================================================================
+# OPTIMIZED FOR:
+#   - 24h horizon: 1,011/28,780 = 3.5% positive (1:28 ratio)
+#   - Main goal: Beat SOTA (TSS > 0.80 @ 24h)
+#   - More moderate oversampling (30-40x instead of 80x)
+#   - Simpler problem = faster convergence
+#
+# Run:
+#   PYTHONPATH="$PWD:$PYTHONPATH" python src/train.py --config src/configs/train_24h_only.yaml --wandb
+# =============================================================================
+
+seed: 42
+device: mps
+
+# =============================================================================
+# MODEL
+# =============================================================================
+model:
+  model_type: hybrid
+  hidden: 256
+  layers: 8
+  learn_eta: false
+  in_channels: 3
+  
+  fourier:
+    max_log2_freq: 4
+    ramp_frac: 0.5
+  
+  encoder:
+    type: gru
+    latent_channels: 32
+    global_dim: 64
+    n_transformer_layers: 3
+    n_heads: 4
+    dropout: 0.15
+    use_checkpoint: false
+
+# =============================================================================
+# CLASSIFIER - OPTIMIZED FOR 24H (3.5% POSITIVE)
+# =============================================================================
+classifier:
+  hidden: 128
+  dropout: 0.35             # Moderate dropout for 1:28 ratio
+  horizons: [24]            # ✅ 24H ONLY!
+  
+  # Class-Balanced Focal Loss tuned for 1:28 imbalance
+  loss_type: cb_focal
+  cb_beta: 0.999            # ✅ Lower beta for moderate imbalance (vs 0.9999 for extreme)
+  focal_gamma: 2.0
+  
+  # Architecture
+  use_attention: true
+  use_physics_features: true
+  use_rf_guidance: true
+  
+  label_smoothing: 0.0
+  confidence_penalty: 0.01
+
+# =============================================================================
+# PHYSICS
+# =============================================================================
+physics:
+  enable: true
+  resistive: true
+  boundary_terms: false
+  mps_fast_physics: true   # ~10x speedup on MPS (skip 2nd-order encoder gradients)
+  
+  # Earlier physics since we have more positive samples
+  lambda_phys_schedule:
+    - [0.0, 0.0]
+    - [0.20, 0.0]           # Shorter warmup (20% vs 25%)
+    - [0.30, 0.3]
+    - [0.5, 1.0]
+    - [0.7, 2.0]
+    - [0.9, 4.0]
+    - [1.0, 5.0]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+# =============================================================================
+# LOSS WEIGHTS
+# =============================================================================
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.5
+
+# =============================================================================
+# COLLOCATION
+# =============================================================================
+collocation:
+  n_max: 16384
+  alpha_start: 0.5
+  alpha_end: 0.85
+  impw_clip_quantile: 0.995
+
+# =============================================================================
+# TRAINING - OPTIMIZED FOR 24H TARGET
+# =============================================================================
+train:
+  steps: 60000
+  batch_size: 2
+  num_workers: 0
+  gradient_accumulation_steps: 1
+  
+  lr: 4.0e-4                # Slightly higher than extreme imbalance case
+  grad_clip: 1.0
+  amp: false
+  
+  log_every: 100
+  eval_every: 2000
+  checkpoint_every: 2000
+  checkpoint_dir: "outputs/checkpoints/train_24h_only"
+  
+  use_ema: true
+  ema_decay: 0.999
+  
+  scheduler:
+    type: cosine
+    warmup_steps: 2500      # Moderate warmup
+    min_lr: 1.0e-6
+  
+  # ✅ MODERATE oversampling for 1:28 ratio (not 1:81!)
+  sampler:
+    strategy: class_balanced
+    positive_multiplier: 35.0   # 30-40x for 3.5% positive rate
+    smoothing: 0.15             # Slight smoothing
+
+# =============================================================================
+# DATA
+# =============================================================================
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: ~/flare_data/consolidated
+  windows_parquet: data/interim/windows_train.parquet
+  
+  target_size: 128
+  input_hours: 48
+  P_per_t: 512
+  pil_top_pct: 0.12
+  val_fraction: 0.15
+  
+  components: ["Bx", "By", "Bz"]
+  
+  scalar_features: ["r_value", "gwpil", "obs_coverage", "frame_count"]
+  use_pil_evolution: true
+  use_temporal_statistics: true
+
+# =============================================================================
+# EXPECTED PERFORMANCE (24H ONLY)
+# =============================================================================
+# With 1,011 positives (3x more than 6h):
+#   - Faster convergence
+#   - Better calibration
+#   - Target: TSS > 0.80 @ 24h to beat SOTA
+#
+# If this hits 0.75-0.80, you can:
+#   1. Add 6h/12h heads later via transfer learning
+#   2. Or train separate models for each horizon
+# =============================================================================
+

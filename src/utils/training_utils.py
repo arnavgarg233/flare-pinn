@@ -338,6 +338,10 @@ class ExponentialMovingAverage:
         # For evaluation
         with ema.average_parameters():
             evaluate()
+        
+        # Checkpointing
+        state = ema.state_dict()
+        ema.load_state_dict(state)
     """
     
     def __init__(self, model: nn.Module, decay: float = 0.999):
@@ -361,6 +365,36 @@ class ExponentialMovingAverage:
                     (1.0 - self.decay) * param.data
                 )
                 self.shadow[name] = new_average.clone()
+    
+    def state_dict(self) -> dict:
+        """
+        Return EMA state for checkpointing.
+        
+        Returns:
+            Dictionary containing decay and shadow parameters
+        """
+        return {
+            'decay': self.decay,
+            'shadow': {name: param.clone() for name, param in self.shadow.items()}
+        }
+    
+    def load_state_dict(self, state_dict: dict) -> None:
+        """
+        Load EMA state from checkpoint.
+        
+        Args:
+            state_dict: Dictionary from state_dict() call
+        """
+        self.decay = state_dict.get('decay', self.decay)
+        shadow_state = state_dict.get('shadow', {})
+        
+        # Load shadow parameters, handling potential key mismatches gracefully
+        # IMPORTANT: Move tensors to same device as model parameters
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in shadow_state:
+                # Clone and move to the same device as the model parameter
+                self.shadow[name] = shadow_state[name].clone().to(param.device)
+            # If key not in checkpoint, keep current shadow (initialized from model)
     
     @contextmanager
     def average_parameters(self):

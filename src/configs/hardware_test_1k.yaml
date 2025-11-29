@@ -1,0 +1,107 @@
+# ============================================================================
+# HARDWARE TEST CONFIG - 1k Steps with FULL Settings
+# ============================================================================
+# PURPOSE: Measure actual training speed with FULL production settings
+# This matches exactly what the full wandb run will use - 1k steps to measure speed
+#
+# Run: PYTHONPATH="$PWD:$PYTHONPATH" python src/train.py --config src/configs/hardware_test_1k.yaml
+# Then extrapolate: if 1k steps takes X minutes, full run will take ~60X minutes
+# ============================================================================
+
+seed: 42
+device: mps  # Auto-detected
+
+# REDUCED MODEL (fits in 16GB MPS memory)
+model:
+  model_type: hybrid
+  hidden: 256        # Reduced from 384
+  layers: 8          # Reduced from 10
+  learn_eta: false
+  in_channels: 3     # Vector magnetogram
+  fourier:
+    max_log2_freq: 4   # Reduced from 5
+    ramp_frac: 0.5
+
+# REDUCED CLASSIFIER
+classifier:
+  hidden: 128        # Reduced from 256
+  dropout: 0.15
+  horizons: [6, 12, 24]
+  loss_type: focal
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  use_attention: true
+  use_physics_features: true
+  label_smoothing: 0.05
+  confidence_penalty: 0.05
+
+# FULL PHYSICS (matches production settings)
+physics:
+  enable: true
+  resistive: true
+  boundary_terms: false
+  mps_fast_physics: true  # ~10x speedup on MPS (disable create_graph)
+  # Full production physics schedule
+  lambda_phys_schedule:
+    - [0.0, 0.0]     # No physics at start
+    - [0.2, 0.0]     # Classifier warm-up
+    - [0.3, 0.3]     # Gentle start
+    - [0.5, 1.0]     # Moderate
+    - [0.7, 2.0]     # Stronger
+    - [0.9, 4.0]     # Strong
+    - [1.0, 5.0]     # Maximum (production)
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+# FULL LOSS WEIGHTS
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.5  # Full physics
+
+# FULL COLLOCATION (mps_fast_physics makes this affordable)
+collocation:
+  n_max: 16384       # Full resolution - now fast with mps_fast_physics
+  alpha_start: 0.5
+  alpha_end: 0.85    # Strong PIL focus - production setting
+  impw_clip_quantile: 0.995
+
+# ONLY DIFFERENCE: 1000 steps instead of 60k
+train:
+  steps: 1000        # Quick test
+  batch_size: 2      # Reduced for memory
+  num_workers: 0     # No multiprocessing (avoids pickle error)
+  gradient_accumulation_steps: 1  # Disable accumulation for stability
+  lr: 1.0e-3
+  grad_clip: 1.0
+  amp: false         # Disable AMP on MPS for stability
+  log_every: 50      # Log frequently
+  eval_every: 500    # Eval at step 500 and 1000
+  checkpoint_every: 10000  # No checkpoints
+  checkpoint_dir: outputs/checkpoints/hardware_test_1k
+  scheduler:
+    type: cosine
+    warmup_steps: 200  # Proportional warmup
+    min_lr: 1.0e-6
+  sampler:
+    strategy: class_balanced
+    positive_multiplier: 10.0
+    smoothing: 0.5
+  use_ema: false  # Skip EMA for speed test
+
+# FULL DATA CONFIG (LOCAL CONSOLIDATED DATA)
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: ~/flare_data/consolidated
+  windows_parquet: data/interim/windows_train.parquet
+  target_size: 128   # Using available 128 resolution data
+  input_hours: 48    # Full history for accuracy
+  P_per_t: 512       # Good resolution for 128x128
+  pil_top_pct: 0.12
+  val_fraction: 0.12
+  scalar_features: ["r_value", "gwpil", "obs_coverage", "frame_count"]
+

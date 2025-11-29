@@ -8,8 +8,16 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
+from .config import EncoderConfig
 from .core import FourierFeatures, fourier_out_dim
-from .encoder import TinyEncoder, TemporalEncoder
+from .encoder import (
+    TinyEncoder,
+    TemporalEncoder,
+    TransformerTemporalEncoder,
+    MultiScaleEncoder,
+    LightweightTemporalEncoder,
+    EfficientGRUEncoder,
+)
 from .latent_sampling import sample_latent_soft_bilinear, sample_latent_nearest
 from .film import FiLM
 
@@ -34,42 +42,90 @@ class HybridPINNBackbone(nn.Module):
     def __init__(
         self,
         encoder_in_channels: int,
-        latent_channels: int = 32,
-        global_dim: int = 64,
+        encoder_cfg: Optional[EncoderConfig] = None,
         hidden: int = 384,
         layers: int = 10,
         max_log2_freq: int = 5,
         film_layers: tuple[int, ...] = (3, 6, 9),
         learn_eta: bool = False,
-        encoder_dropout: float = 0.05,
-        use_temporal_encoder: bool = True,
         n_field_components: int = 1,
     ):
         super().__init__()
         
-        self.use_temporal_encoder = use_temporal_encoder
+        encoder_cfg = encoder_cfg or EncoderConfig()
+        self.encoder_type = encoder_cfg.type
+        latent_channels = encoder_cfg.latent_channels
+        global_dim = encoder_cfg.global_dim
+        encoder_dropout = encoder_cfg.dropout
+        use_checkpoint = encoder_cfg.use_checkpoint
         self.n_field_components = n_field_components
         
-        if use_temporal_encoder:
-            # Advanced temporal encoder
+        # ------------------------------------------------------------------ #
+        # Encoder selection (config-driven)
+        # ------------------------------------------------------------------ #
+        if self.encoder_type == "transformer":
+            self.encoder = TransformerTemporalEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                d_model=max(encoder_cfg.latent_channels * 4, global_dim),
+                n_heads=encoder_cfg.n_heads,
+                n_layers=encoder_cfg.n_transformer_layers,
+                dropout=encoder_dropout,
+            )
+            self.effective_latent_channels = latent_channels * 2
+            self.use_temporal_encoder = True
+        elif self.encoder_type == "lightweight":
+            self.encoder = LightweightTemporalEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                temporal_dim=latent_channels,
+                dropout=encoder_dropout,
+                max_frames=64,
+                use_checkpoint=use_checkpoint,
+            )
+            self.effective_latent_channels = latent_channels * 2
+            self.use_temporal_encoder = True
+        elif self.encoder_type == "gru":
+            self.encoder = EfficientGRUEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                dropout=encoder_dropout,
+                use_checkpoint=use_checkpoint,
+            )
+            self.effective_latent_channels = latent_channels * 2
+            self.use_temporal_encoder = True
+        elif self.encoder_type == "multiscale":
+            self.encoder = MultiScaleEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                dropout=encoder_dropout,
+            )
+            self.effective_latent_channels = latent_channels
+            self.use_temporal_encoder = False
+        elif self.encoder_type == "tiny":
+            self.encoder = TinyEncoder(
+                in_channels=encoder_in_channels,
+                latent_channels=latent_channels,
+                global_dim=global_dim,
+                dropout=encoder_dropout,
+                use_checkpoint=use_checkpoint,
+            )
+            self.effective_latent_channels = latent_channels
+            self.use_temporal_encoder = False
+        else:
+            # Default: temporal encoder (same as previous behaviour)
             self.encoder = TemporalEncoder(
                 in_channels=encoder_in_channels,
                 latent_channels=latent_channels,
                 global_dim=global_dim,
                 dropout=encoder_dropout
             )
-            # TemporalEncoder returns concatenated [weighted_L, last_L] -> 2 * latent_channels
             self.effective_latent_channels = latent_channels * 2
-        else:
-            # Simple frame-averaged encoder
-            self.encoder = TinyEncoder(
-                in_channels=encoder_in_channels,
-                latent_channels=latent_channels,
-                global_dim=global_dim,
-                dropout=encoder_dropout,
-                use_checkpoint=True
-            )
-            self.effective_latent_channels = latent_channels
+            self.use_temporal_encoder = True
         
         # Fourier features
         self.ff = FourierFeatures(3, max_log2_freq)
@@ -112,8 +168,12 @@ class HybridPINNBackbone(nn.Module):
             if (i + 1) in self.film_layers:  # Layer indexing: 1-based
                 self.film_modules[str(i + 1)] = FiLM(hidden, global_dim)
         
-        # Output head
+        # Output head with small initialization for stable starting point
         self.head = nn.Linear(hidden, out_dim)
+        with torch.no_grad():
+            nn.init.xavier_uniform_(self.head.weight, gain=0.1)
+            nn.init.zeros_(self.head.bias)
+            
         self.learn_eta = learn_eta
         self.latent_channels = latent_channels
         self.global_dim = global_dim
@@ -140,11 +200,39 @@ class HybridPINNBackbone(nn.Module):
         """
         if self.use_temporal_encoder:
             if observed_mask is None:
-                raise ValueError("observed_mask required for TemporalEncoder")
-            L, g, _ = self.encoder(frames, observed_mask)
-            return L, g
+                raise ValueError(f"observed_mask required for {self.encoder_type} encoder")
+            L, g, *_ = self.encoder(frames, observed_mask)
         else:
-            return self.encoder(frames)
+            # Aggregate observed frames (or all frames if mask not provided)
+            obs_frames = frames if observed_mask is None else frames[observed_mask]
+            if obs_frames.shape[0] == 0:
+                H, W = frames.shape[-2:]
+                device = frames.device
+                latent_ch = self.effective_latent_channels
+                L = torch.zeros(1, latent_ch, H, W, device=device)
+                g = torch.zeros(1, self.global_dim, device=device)
+                return L, g
+            
+            if obs_frames.dim() == 3:
+                frames_input = obs_frames.mean(dim=0, keepdim=True).unsqueeze(0)
+            else:
+                frames_input = obs_frames.mean(dim=0, keepdim=True)
+            
+            L, g = self.encoder(frames_input)
+        
+        # NaN/Inf safety and clamping for stability
+        # FIXED: Use any() checks to avoid MPS synchronization issues
+        with torch.no_grad():
+            if torch.isnan(L).any() or torch.isinf(L).any():
+                L = torch.nan_to_num(L, nan=0.0, posinf=1.0, neginf=-1.0)
+        L = L.clamp(-10.0, 10.0)
+        
+        with torch.no_grad():
+            if torch.isnan(g).any() or torch.isinf(g).any():
+                g = torch.nan_to_num(g, nan=0.0, posinf=1.0, neginf=-1.0)
+        g = g.clamp(-10.0, 10.0)
+        
+        return L, g
     
     def forward(
         self,
@@ -191,6 +279,18 @@ class HybridPINNBackbone(nn.Module):
         # Fourier features
         ff = self.ff(coords)  # [N, FF_dim]
         
+        # FIXED: NaN/Inf safety checks before concatenation
+        # Use any() checks to avoid MPS synchronization issues
+        with torch.no_grad():
+            if torch.isnan(L_sampled).any() or torch.isinf(L_sampled).any():
+                L_sampled = torch.nan_to_num(L_sampled, nan=0.0, posinf=1.0, neginf=-1.0)
+        L_sampled = L_sampled.clamp(-10.0, 10.0)
+        
+        with torch.no_grad():
+            if torch.isnan(g_expanded).any() or torch.isinf(g_expanded).any():
+                g_expanded = torch.nan_to_num(g_expanded, nan=0.0, posinf=1.0, neginf=-1.0)
+        g_expanded = g_expanded.clamp(-10.0, 10.0)
+        
         # Concatenate all inputs
         z = torch.cat([coords, ff, L_sampled, g_expanded], dim=-1)  # [N, in_dim]
         
@@ -198,11 +298,18 @@ class HybridPINNBackbone(nn.Module):
         h = z
         for i, (layer, act) in enumerate(zip(self.layers_list, self.activations), start=1):
             h = act(layer(h))
+            # Apply FiLM conditioning (if applicable for this layer)
             if i in self.film_layers:
                 h = self.film_modules[str(i)](h, g_expanded)
         
         # Output head
         out = self.head(h)
+        
+        # ⚡ SAFETY: Tight clamp on outputs to prevent NaN in physics gradients
+        # ±10 chosen because: typical field values are O(1), sigmoid(10)≈1, tanh(10)≈1
+        # Beyond ±10: gradients vanish, physics residuals explode, autograd.grad fails
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        out = out.clamp(-10.0, 10.0)
         
         # Split outputs
         # Layout: [A (C), B (C), u (2), eta (1?)]
@@ -234,4 +341,3 @@ class HybridPINNBackbone(nn.Module):
             "u_x": u[..., 0:1],
             "u_y": u[..., 1:2]
         }
-

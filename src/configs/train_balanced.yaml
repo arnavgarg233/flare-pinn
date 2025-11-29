@@ -1,0 +1,245 @@
+# =============================================================================
+# SOTA CONFIG - BALANCED & STABLE (Resume from 14k)
+# =============================================================================
+# KEY DESIGN PRINCIPLE: Don't stack too many reweighting mechanisms!
+#   - ONE imbalance handler: cb_focal (not sampler + focal + aggressive beta)
+#   - ONE task balancer: GradNorm (not LRA + schedule + manual lambda)
+#   - ONE temporal weighting: causal_decay=1.0 (modest, not aggressive 2.0)
+#
+# ACTIVE METHODS:
+#   ✅ cb_focal (cb_beta=0.9999): Handles per-horizon class imbalance
+#   ✅ GradNorm: Auto-balances classification vs physics
+#   ✅ RAR: Adaptive collocation focusing on hard physics regions
+#   ✅ Causal Training: Modest early-time preference (decay=1.0)
+#
+# Per-Horizon Stats:
+#   6h:  355/28780 = 1.2% (1:81 ratio) → ~28x weight
+#   12h: 615/28780 = 2.1% (1:47 ratio) → ~16x weight
+#   24h: 1011/28780 = 3.5% (1:28 ratio) → ~10x weight
+#
+# Run (resume from 14k checkpoint):
+#   PYTHONPATH="$PWD:$PYTHONPATH" python src/train.py --config src/configs/train_balanced.yaml --wandb --resume outputs/checkpoints/train_balanced/checkpoint_step_0014000.pt
+# =============================================================================
+
+seed: 24  # Changed from 42 to test if hang is data-sample specific
+device: mps
+
+# =============================================================================
+# MODEL
+# =============================================================================
+model:
+  model_type: hybrid
+  hidden: 256
+  layers: 8
+  learn_eta: false
+  in_channels: 3
+  
+  fourier:
+    max_log2_freq: 4
+    ramp_frac: 0.5
+  
+  encoder:
+    type: gru
+    latent_channels: 32
+    global_dim: 64
+    n_transformer_layers: 3
+    n_heads: 4
+    dropout: 0.15
+    use_checkpoint: true  # ⚡ SPEED: Gradient checkpointing saves ~30% memory, slight speed cost
+
+# =============================================================================
+# CLASSIFIER - HORIZON-BALANCED SETUP
+# =============================================================================
+classifier:
+  hidden: 128
+  dropout: 0.40             # High dropout to prevent 24h from overfitting
+  horizons: [6, 12, 24]     # All 3 horizons
+  
+  # ✅ Class-Balanced Focal Loss (Cui et al. 2019)
+  # Automatically computes per-horizon weights based on sample counts!
+  # With cb_beta=0.9999:
+  #   6h:  1:81 ratio → gets ~28x more weight than negatives
+  #   12h: 1:47 ratio → gets ~16x more weight than negatives  
+  #   24h: 1:28 ratio → gets ~10x more weight than negatives
+  # This is the MAIN imbalance handler - sampler is disabled to avoid triple-stacking!
+  loss_type: cb_focal
+  cb_beta: 0.9999           # Standard aggressive (not 0.99999 - avoid over-correction)
+  focal_gamma: 2.0          # Focusing parameter (2.0 = standard)
+  focal_alpha: 0.75         # Fallback alpha (not used with cb_focal, but kept for safety)
+  
+  # Architecture
+  use_attention: true
+  use_physics_features: true
+  use_rf_guidance: true
+  
+  # NO label smoothing - hurts rare classes
+  label_smoothing: 0.0
+  confidence_penalty: 0.02
+
+# =============================================================================
+# PHYSICS - GradNorm for automatic loss balancing
+# =============================================================================
+physics:
+  enable: true
+  resistive: true
+  boundary_terms: false
+  mps_fast_physics: false  # create_graph=True - full gradient flow, RAR preserves graph
+  physics_grad_scale: 1.0  # Full physics gradients - GradNorm handles balancing
+  
+  # ✅ GradNorm ENABLED (Chen et al. 2018)
+  # Automatically balances classification vs physics by equalizing gradient scales
+  # Much better than fixed lambda schedules for multi-task learning!
+  use_gradnorm: true
+  gradnorm_alpha: 1.5      # Restoring force strength (1.5 = moderate equalization)
+  gradnorm_update_freq: 15 # ⚡ SPEED: Update every 15 steps (was 7) - still converges, less overhead
+  
+  # LRA disabled (GradNorm is better)
+  use_lra: false
+  
+  # Causal Training - Weight earlier timesteps more (enforces temporal causality)
+  # Works well WITH GradNorm - they handle different things:
+  #   - Causal: temporal weighting of collocation points
+  #   - GradNorm: task-level loss balancing
+  use_causal_training: true
+  causal_decay: 1.0        # Softened from 2.0 (avoid stacking too many strong reweightings)
+  
+  # Fallback schedule - UNUSED when use_gradnorm=true
+  # GradNorm is the ONLY mechanism deciding physics vs cls weight (base λ=1.0)
+  lambda_phys_schedule:
+    - [0.0, 1.0]            # UNUSED when use_gradnorm=true (base=1.0)
+    - [1.0, 1.0]
+
+eta:
+  min: 1.0e-4
+  max: 1.0
+  tv_weight: 1.0e-3
+
+# =============================================================================
+# LOSS WEIGHTS
+# =============================================================================
+loss_weights:
+  cls: 1.0
+  data: 1.0
+  curl_consistency: 0.5
+
+# =============================================================================
+# COLLOCATION
+# =============================================================================
+collocation:
+  n_max: 4096              # Reduced for speed - GradNorm handles balancing
+  alpha_start: 0.5
+  alpha_end: 0.85
+  impw_clip_quantile: 0.995
+  
+  # ✅ Adaptive Resampling (RAR - McClenny & Braga-Neto 2020)
+  # Resample collocation points based on physics residual magnitude
+  # Focuses compute on hard regions where physics is violated
+  use_adaptive_resampling: true
+  adaptive_resample_freq: 25   # ⚡ SPEED: Resample every 25 steps (was 13) - still effective, less overhead
+  adaptive_keep_ratio: 0.3     # Keep top 30% highest-residual points
+
+# =============================================================================
+# TRAINING - HORIZON-AWARE SAMPLING
+# =============================================================================
+train:
+  steps: 60000
+  batch_size: 2
+  num_workers: 2  # ⚡ SPEED: Enable workers for CPU-GPU overlap (PIL features compute while GPU trains)
+  gradient_accumulation_steps: 1
+  
+  lr: 3.0e-4                # Goldilocks LR: not too aggressive for stage 3 resume
+  grad_clip: 1.0
+  amp: false
+  
+  log_every: 100
+  eval_every: 2000
+  checkpoint_every: 2000
+  checkpoint_dir: "outputs/checkpoints/train_balanced"  # Resume from existing checkpoints
+  
+  use_ema: true
+  ema_decay: 0.999
+  
+  scheduler:
+    type: cosine
+    warmup_steps: 1000      # Short warmup for curriculum stage 3 (resuming from 14k)
+    min_lr: 1.0e-6
+  
+  # Sampler: DISABLED - cb_focal handles imbalance, don't triple-stack!
+  # Having cb_focal + focal_gamma + aggressive sampler = too much reweighting
+  # Let cb_focal be the MAIN imbalance tool
+  sampler:
+    strategy: random            # Random sampling (cb_focal handles class weights)
+    positive_multiplier: 1.0    # Disabled (was 15.0)
+    smoothing: 1.0              # Disabled
+
+# =============================================================================
+# DATA
+# =============================================================================
+data:
+  use_real: true
+  use_consolidated: true
+  consolidated_dir: ~/flare_data/consolidated
+  windows_parquet: data/interim/windows_train.parquet
+  
+  target_size: 128
+  input_hours: 48
+  P_per_t: 512
+  pil_top_pct: 0.12
+  val_fraction: 0.15
+  
+  components: ["Bx", "By", "Bz"]
+  
+  scalar_features: ["r_value", "gwpil", "obs_coverage", "frame_count"]
+  # NOTE: Cannot disable PIL evolution - checkpoint was trained with 16 features!
+  # Disabling would cause dimension mismatch in classifier.scalar_proj
+  use_pil_evolution: true
+  use_temporal_statistics: true
+
+# =============================================================================
+# HOW THIS HANDLES EACH HORIZON
+# =============================================================================
+# The cb_focal loss with cb_beta=0.9999 computes effective weights per-horizon:
+#
+# For 6h (355 positives, 28425 negatives):
+#   effective_pos_6h  = (1 - 0.9999^355) / (1 - 0.9999) ≈ 355
+#   effective_neg_6h  = (1 - 0.9999^28425) / (1 - 0.9999) ≈ 10,000
+#   weight_ratio_6h   = 10000/355 ≈ 28x MORE weight to positives
+#
+# For 12h (615 positives, 28165 negatives):
+#   effective_pos_12h = (1 - 0.9999^615) / (1 - 0.9999) ≈ 615
+#   effective_neg_12h = (1 - 0.9999^28165) / (1 - 0.9999) ≈ 10,000
+#   weight_ratio_12h  = 10000/615 ≈ 16x MORE weight to positives
+#
+# For 24h (1011 positives, 27769 negatives):
+#   effective_pos_24h = (1 - 0.9999^1011) / (1 - 0.9999) ≈ 1011
+#   effective_neg_24h = (1 - 0.9999^27769) / (1 - 0.9999) ≈ 10,000
+#   weight_ratio_24h  = 10000/1011 ≈ 10x MORE weight to positives
+#
+# Result: 6h automatically gets 2.8x more loss weight than 24h!
+#         The loss function ADAPTS to each horizon's imbalance.
+# =============================================================================
+
+# =============================================================================
+# STABILITY NOTES
+# =============================================================================
+#
+# Why this config is stable:
+#   1. cb_focal is the ONLY imbalance handler (sampler disabled)
+#   2. GradNorm is the ONLY task balancer (lambda=1.0 base, no schedule interference)
+#   3. causal_decay=1.0 is modest (not aggressive 2.0)
+#   4. lr=3e-4 is "goldilocks" for stage 3 resume (not too hot, not too cold)
+#
+# What each component does (NO OVERLAP):
+#   - cb_focal: Per-horizon class weighting (6h > 12h > 24h)
+#   - GradNorm: Classification vs Physics balance (adapts automatically)
+#   - RAR: Spatial focus (high-residual regions get more compute)
+#   - Causal: Temporal focus (earlier times slightly preferred)
+#
+# If training becomes unstable:
+#   - Check GradNorm weights in logs (should be ~0.5-2.0 range)
+#   - If NaN: try mps_fast_physics: false
+#   - If physics loss stuck: try lr: 5e-4 (more aggressive)
+#   - If TSS drops: check if GradNorm is over-weighting physics
+#
+# =============================================================================
+

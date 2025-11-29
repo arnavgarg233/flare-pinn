@@ -87,15 +87,15 @@ def process_harp(args: tuple) -> dict | None:
             if bz.shape != (target_size, target_size):
                 H, W = bz.shape
                 def resize_crop(img):
-                    out = np.zeros((target_size, target_size), np.float32)
-                    y0 = max(0, (target_size - H) // 2)
-                    x0 = max(0, (target_size - W) // 2)
-                    y1 = y0 + min(H, target_size)
-                    x1 = x0 + min(W, target_size)
-                    sy0 = max(0, (H - target_size) // 2)
-                    sx0 = max(0, (W - target_size) // 2)
-                    sy1 = sy0 + (y1 - y0)
-                    sx1 = sx0 + (x1 - x0)
+                out = np.zeros((target_size, target_size), np.float32)
+                y0 = max(0, (target_size - H) // 2)
+                x0 = max(0, (target_size - W) // 2)
+                y1 = y0 + min(H, target_size)
+                x1 = x0 + min(W, target_size)
+                sy0 = max(0, (H - target_size) // 2)
+                sx0 = max(0, (W - target_size) // 2)
+                sy1 = sy0 + (y1 - y0)
+                sx1 = sx0 + (x1 - x0)
                     out[y0:y1, x0:x1] = img[sy0:sy1, sx0:sx1]
                     return out
                 
@@ -125,12 +125,12 @@ def process_harp(args: tuple) -> dict | None:
             for c in range(3):
                 img = stack[c]
                 data_range = np.abs(img).max()
-                if data_range > 10:
+            if data_range > 10:
                     img = img / 2000.0
-                elif data_range > 0:
+            elif data_range > 0:
                     img = img / max(data_range, 5.0)
                 stack[c] = np.clip(img, -1.5, 1.5)
-
+            
             ts = pd.Timestamp(date_obs).floor('s')  # Round to seconds to match lookup format
             ts_key = ts.strftime("%Y-%m-%dT%H:%M:%S+00:00")  # Consistent format
             harp_data[ts_key] = stack

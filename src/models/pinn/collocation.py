@@ -89,7 +89,10 @@ def clip_and_renorm_importance(
         
         for attempt in range(max_attempts):
             # Soft clip by quantile to prevent extreme values
-            thr = torch.quantile(w, float(current_quantile))
+            # FIXED: Avoid torch.quantile on MPS - use sorted-based approximation
+            w_sorted = torch.sort(w.flatten()).values
+            idx = int(float(current_quantile) * (w_sorted.numel() - 1))
+            thr = w_sorted[idx]
             
             # Hard clip to prevent extreme ratios
             min_w = w.min().clamp(min=1e-12)
@@ -113,10 +116,12 @@ def clip_and_renorm_importance(
             current_quantile = max(0.5, current_quantile - 0.1)
             max_weight_ratio = max(10.0, max_weight_ratio * 0.5)
     
-    return w_tilde, float(thr.item())
+    # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
+    return w_tilde, float(thr.detach().cpu())
 
 def ess(weights: torch.Tensor) -> float:
     """Effective sample size for normalized weights w̃."""
+    # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
     w = weights / weights.sum()
-    return float(1.0 / (w**2).sum().item())
+    return float(1.0 / (w**2).sum().detach().cpu())
 

@@ -102,6 +102,9 @@ class PINNModel(nn.Module):
         use_attention = getattr(cfg.classifier, 'use_attention', True)
         use_physics_features = getattr(cfg.classifier, 'use_physics_features', True)
         
+        # Determine field component count: 3 for vector_B mode, 1 otherwise
+        n_field_components = 3 if vector_B else 1
+        
         self.classifier = ClassifierHead(
             hidden=cfg.classifier.hidden,
             dropout=cfg.classifier.dropout,
@@ -109,6 +112,7 @@ class PINNModel(nn.Module):
             use_attention=use_attention,
             use_physics_features=use_physics_features,
             n_scalar_features=n_scalar_features,
+            n_field_components=n_field_components,  # FIXED: Support multi-component fields
         )
         
         # Physics module: use VectorInduction2p5D for vector mode
@@ -151,12 +155,14 @@ class PINNModel(nn.Module):
         """Get current physics loss weight from schedule."""
         if not self.cfg.physics.enable:
             return 0.0
-        frac = float(self._train_frac.item())
+        # FIXED: Avoid .item() which can hang on MPS
+        frac = float(self._train_frac.detach())
         return interp_schedule(self.cfg.physics.lambda_phys_schedule, frac)
     
     def get_collocation_alpha(self) -> float:
         """Get current PIL bias weight (interpolates from alpha_start to alpha_end)."""
-        frac = float(self._train_frac.item())
+        # FIXED: Avoid .item() which can hang on MPS
+        frac = float(self._train_frac.detach())
         a0 = self.cfg.collocation.alpha_start
         a1 = self.cfg.collocation.alpha_end
         return a0 + (a1 - a0) * frac
@@ -192,7 +198,10 @@ class PINNModel(nn.Module):
         # Flatten coords for backbone
         original_shape = coords.shape
         coords_flat = coords.reshape(-1, 3).contiguous()
-        coords_flat.requires_grad_(True)
+        coords_flat = coords_flat.requires_grad_(True)  # Ensure in-place returns self
+        
+        # Verify requires_grad is actually set (MPS can be quirky)
+        assert coords_flat.requires_grad, "coords_flat must require grad for physics loss"
         
         # Infer batch size from shape or labels
         if len(original_shape) == 3:
@@ -207,24 +216,24 @@ class PINNModel(nn.Module):
         
         # Forward through backbone
         out = self.backbone(coords_flat)
-        A_z = out.A_z
-        eta_raw = out.eta_raw
+        A_z = out["A_z"]
+        eta_raw = out.get("eta_raw")
         
         # Handle vector vs scalar mode
         if self.vector_B:
             # Vector mode: B and u are packed tensors
-            B_vec = out.B         # [N, 3]
-            u_vec = out.u         # [N, 2]
-            B_x = out.B_x
-            B_y = out.B_y
-            B_z = out.B_z
-            u_x = out.u_x
-            u_y = out.u_y
+            B_vec = out["B"]         # [N, 3]
+            u_vec = out["u"]         # [N, 2]
+            B_x = out["B_x"]
+            B_y = out["B_y"]
+            B_z = out["B_z"]
+            u_x = out["u_x"]
+            u_y = out["u_y"]
         else:
             # Scalar mode (legacy)
-            B_z = out.B_z
-            u_x = out.u_x
-            u_y = out.u_y
+            B_z = out["B_z"]
+            u_x = out["u_x"]
+            u_y = out["u_y"]
             B_vec = None
             u_vec = None
             B_x, B_y = None, None
@@ -258,10 +267,16 @@ class PINNModel(nn.Module):
         logits = self.classifier(feats_dict, observed_mask.unsqueeze(0), scalars=scalars)  # [B, n_horizons]
         probs = torch.sigmoid(logits)
         
+        # Safety: clamp probs to valid range (prevents any floating point weirdness)
+        probs = probs.clamp(0.0, 1.0)
+        
         # ============ Compute Losses ============
         
+        # Note: Fallback losses use (logits * 0).sum() to create zero tensors 
+        # that ARE connected to the computation graph (not leaf tensors).
+        # This ensures gradients can flow through even when some losses are disabled.
+        
         # 1. Classification loss
-        loss_cls = torch.tensor(0.0, device=device)
         if mode == "train" and labels is not None:
             if self.cfg.classifier.loss_type == "focal":
                 loss_cls = focal_loss(
@@ -271,9 +286,11 @@ class PINNModel(nn.Module):
                 )
             else:  # bce
                 loss_cls = bce_logits(logits, labels, pos_weight=self.cfg.classifier.pos_weight)
+        else:
+            # Zero loss but connected to computation graph
+            loss_cls = (logits * 0).sum()
         
         # 2. Data fitting loss (L1 on observed Bz)
-        loss_data = torch.tensor(0.0, device=device)
         if mode == "train" and gt_bz is not None:
             # Mask: only compute loss on observed frames
             # Fix broadcasting: observed_mask is [T], need [B, T, P, 1]
@@ -286,9 +303,12 @@ class PINNModel(nn.Module):
             if gt_bz.dim() == 3:
                 gt_bz = gt_bz.unsqueeze(0)  # [T,P,1] -> [1,T,P,1]
             loss_data = l1_data(feats_dict["B_z"], gt_bz, mask_expanded)
+        else:
+            # Zero loss but connected to computation graph
+            loss_data = (B_z * 0).sum()
         
         # 3. Physics loss (weak-form induction)
-        loss_phys = torch.tensor(0.0, device=device)
+        loss_phys = (logits * 0).sum()  # Default: zero but graph-connected
         ess_val = 0.0
         lambda_phys = self.get_lambda_phys()
         phys_info = None  # Will be VectorPhysicsResidualInfo in vector mode
@@ -342,8 +362,12 @@ class PINNModel(nn.Module):
                 imp_weights, _ = clip_and_renorm_importance(p_uniform, self.cfg.collocation.impw_clip_quantile)
             
             # ESS (Effective Sample Size) - measure of sampling efficiency
+            # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
             w_sq_sum = (imp_weights ** 2).sum()
-            ess_val = float((imp_weights.sum() ** 2) / (w_sq_sum.item() + 1e-8))
+            with torch.no_grad():
+                w_sum_val = float(imp_weights.sum().detach().cpu())
+                w_sq_sum_val = float(w_sq_sum.detach().cpu())
+            ess_val = (w_sum_val ** 2) / (w_sq_sum_val + 1e-8)
             
             # Compute physics residual
             eta_mode = "field" if self.cfg.model.learn_eta else "scalar"
@@ -357,7 +381,7 @@ class PINNModel(nn.Module):
             loss_phys = lambda_phys * loss_phys_raw
         
         # 4. Optional curl consistency loss (B_perp from Az vs direct prediction)
-        loss_curl = torch.tensor(0.0, device=device)
+        loss_curl = (A_z * 0).sum()  # Default: zero but graph-connected
         if mode == "train" and self.cfg.loss_weights.curl_consistency > 0 and B_x is not None:
             # Compute B_perp from vector potential and compare with direct prediction
             # B = curl(A) => Bx = -dAz/dy, By = dAz/dx
@@ -375,6 +399,26 @@ class PINNModel(nn.Module):
             loss_phys +
             self.cfg.loss_weights.curl_consistency * loss_curl
         )
+        
+        # Safety check: ensure loss_total has a gradient connection to model params
+        # This can fail if all loss components are zero-valued leaf tensors
+        if not loss_total.requires_grad:
+            import warnings
+            warnings.warn(
+                f"loss_total does not require grad! "
+                f"loss_cls.requires_grad={loss_cls.requires_grad}, "
+                f"loss_data.requires_grad={loss_data.requires_grad}, "
+                f"loss_phys.requires_grad={loss_phys.requires_grad}, "
+                f"loss_curl.requires_grad={loss_curl.requires_grad}"
+            )
+            # Reconnect by adding a zero-valued term that IS connected to the computation graph
+            # Use logits since it's always computed and connected to model parameters
+            loss_total = loss_total + (logits * 0).sum()
+            # Double-check the reconnection worked
+            if not loss_total.requires_grad:
+                # Last resort: connect via a model parameter directly
+                first_param = next(iter(self.parameters()))
+                loss_total = loss_total + (first_param * 0.0).sum()
         
         # Convert phys_info to VectorPhysicsResidualInfo if it's the legacy type
         vector_phys_info = None
@@ -401,7 +445,8 @@ class PINNModel(nn.Module):
             loss_total=loss_total,
             ess=ess_val,
             lambda_phys=lambda_phys,
-            fourier_alpha=self.backbone.ff._alpha.item(),
+            # FIXED: Avoid .item() which can hang on MPS
+            fourier_alpha=float(self.backbone.ff._alpha.detach()),
             physics_info=vector_phys_info,
         )
     
