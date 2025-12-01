@@ -42,6 +42,7 @@ wheels/
 *.err
 outputs/logs/*.txt
 outputs/logs/*.log
+wandb/
 
 # Temporary files
 *.tmp
