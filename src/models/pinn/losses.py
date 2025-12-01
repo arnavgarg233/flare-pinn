@@ -1,8 +1,10 @@
 # src/models/pinn/losses.py
 from __future__ import annotations
+
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
-from typing import Optional
 
 def interp_schedule(schedule: list[list[float]], frac: float) -> float:
     """

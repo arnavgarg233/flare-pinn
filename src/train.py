@@ -121,10 +121,9 @@ class DummyPINNDataset(Dataset):
         labels = (torch.rand(len(self.horizons)) < 0.2).float()
         
         # PIL mask (high gradient regions) - as tensor for type consistency
-        # Use Bz (channel 0) for PIL
-        frame_bz = frames[-1, -1] if C > 0 else frames[-1] # Last channel usually Bz? Or first? Config says ["Bx", "By", "Bz"]
-        # Actually check config order. Assuming index -1 is Bz.
-        frame_bz = frames[-1, -1] 
+        # Use last channel for Bz (convention: components = ["Bx", "By", "Bz"] or ["Bz"])
+        # frames shape: [T, C, H, W], take last timestep and last channel (Bz)
+        frame_bz = frames[-1, -1]  # [H, W] - last timestep, last channel (Bz)
         
         grad_x = torch.abs(frame_bz[:, 1:] - frame_bz[:, :-1])  # [H, W-1]
         grad_y = torch.abs(frame_bz[1:, :] - frame_bz[:-1, :])  # [H-1, W]
@@ -232,7 +231,7 @@ class CheckpointManager:
         """
         Save checkpoint with full training state.
         
-        Now includes EMA, scheduler, and early stopping state for proper resumption.
+        Includes EMA, scheduler, and early stopping state for proper resumption.
         """
         checkpoint = {
             'step': step,
@@ -346,7 +345,7 @@ class CheckpointManager:
             early_stopping.best_step = es_state.get('best_step', 0)
             early_stopping.counter = es_state.get('counter', 0)
             
-            # ✅ FIX #16: Warn if patience/min_delta changed since checkpoint
+            # Warn if patience/min_delta changed since checkpoint
             saved_patience = es_state.get('patience')
             saved_min_delta = es_state.get('min_delta')
             if saved_patience is not None and saved_patience != early_stopping.patience:
@@ -370,8 +369,7 @@ class CheckpointManager:
 
 @dataclass
 class MetricsBuffer:
-    max_size: int = 100  # REDUCED from 500 to prevent memory leaks
-    # ✅ FIX: Use deque for O(1) pop from left (was O(n) with list.pop(0))
+    max_size: int = 100
     probs: deque = field(default_factory=lambda: deque(maxlen=100))
     labels: deque = field(default_factory=lambda: deque(maxlen=100))
     
@@ -437,7 +435,7 @@ class PINNTrainer:
         self.logger = logger
         self.device = self._get_device(cfg.device)
         
-        # CRITICAL: Force num_workers=0 on MPS to prevent memory leaks
+        # Force num_workers=0 on MPS to prevent memory leaks
         if self.device.type == "mps" and cfg.train.num_workers > 0:
             self.logger.warning(f"⚠️  Forcing num_workers=0 on MPS (was {cfg.train.num_workers}) to prevent memory leaks")
             cfg.train.num_workers = 0
@@ -486,22 +484,27 @@ class PINNTrainer:
             self.scaler = None  # MPS doesn't use GradScaler
         
         # Gradient accumulation for effective larger batches
-        accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 1)
-        if accum_steps > 1:
+        self.accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 1)
+        if self.accum_steps > 1:
             self.grad_accumulator = MPSGradientAccumulator(
                 self.model,
                 self.optimizer,
-                accum_steps=accum_steps,
+                accum_steps=self.accum_steps,
                 grad_clip=cfg.train.grad_clip,
                 cleanup_every=getattr(cfg.train, 'memory_cleanup_every', 50)
             )
-            self.logger.info(f"Gradient accumulation: {accum_steps} steps (effective batch = {cfg.train.batch_size * accum_steps})")
+            self.logger.info(f"Gradient accumulation: {self.accum_steps} steps (effective batch = {cfg.train.batch_size * self.accum_steps})")
         else:
             self.grad_accumulator = None
         
         # Scheduler
+        # ⚡ SAFETY: Account for gradient accumulation in scheduler steps
+        # If accum_steps > 1, optimizer steps (and scheduler.step) happen less frequently.
+        # We must scale T_max so the scheduler decays over the correct number of *epochs* (steps).
+        # If cfg.train.steps means "total micro-batches", T_max should be steps // accum_steps.
+        effective_total_steps = max(1, cfg.train.steps // (self.accum_steps if self.accum_steps > 1 else 1))
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=cfg.train.steps, eta_min=cfg.train.scheduler.min_lr
+            self.optimizer, T_max=effective_total_steps, eta_min=cfg.train.scheduler.min_lr
         )
         
         # EMA for better generalization
@@ -511,7 +514,7 @@ class PINNTrainer:
             self.ema = ExponentialMovingAverage(self.model, decay=cfg.train.ema_decay)
             self.logger.info(f"EMA enabled with decay={cfg.train.ema_decay}")
         
-        # Early stopping - FIXED: Balance patience for physics training
+        # Early stopping - Balance patience for physics training
         # With eval_every=2000, patience=12 means 24k steps without improvement
         # This allows physics to stabilize while catching genuine plateaus
         from src.utils.training_utils import EarlyStopping
@@ -524,6 +527,13 @@ class PINNTrainer:
         self.metrics_buffer = MetricsBuffer()
         self.step = 0
         self.best_val_tss = 0.0
+        
+        # Plateau rollback: if TSS drops for N consecutive evals, reload best and reduce LR
+        self.plateau_patience = getattr(cfg.train, 'plateau_patience', 3)  # consecutive drops before rollback
+        self.plateau_lr_factor = getattr(cfg.train, 'plateau_lr_factor', 0.5)  # LR reduction factor
+        self.consecutive_drops = 0
+        self.last_val_tss = 0.0
+        self.min_lr_for_rollback = 1e-7  # don't rollback if LR already tiny
         
         # MPS-specific settings
         self.memory_cleanup_every = getattr(cfg.train, 'memory_cleanup_every', 50)
@@ -539,13 +549,16 @@ class PINNTrainer:
 
     def train_step(self, batch: dict) -> dict:
         # Move all tensors to device
+        # Remove non_blocking=True on MPS to prevent memory corruption/race conditions
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
-                batch[k] = v.to(self.device, non_blocking=True)
+                batch[k] = v.to(self.device)  # Synchronous transfer
         
-        # ⚡ SAFETY: Validate inputs and sanitize NaN/Inf (with logging)
-        for k in ["frames", "coords", "scalar_features"]:
-            if k in batch and batch[k] is not None:
+        # Validate inputs and sanitize NaN/Inf (with logging)
+        # Check all input tensors including gt_bz, pil_mask, scalars
+        tensor_keys = ["frames", "coords", "scalar_features", "gt_bz", "pil_mask", "scalars", "observed_mask"]
+        for k in tensor_keys:
+            if k in batch and batch[k] is not None and isinstance(batch[k], torch.Tensor):
                 has_nan = torch.isnan(batch[k]).any()
                 has_inf = torch.isinf(batch[k]).any()
                 if has_nan or has_inf:
@@ -588,8 +601,9 @@ class PINNTrainer:
                 loss = out.loss_total
                 probs = out.probs
                 labels = batch["labels"]
-                total_phys = float(out.loss_phys.detach().cpu())
-                total_cls = float(out.loss_cls.detach().cpu())
+                # Handle potential None or zero values safely
+                total_phys = float(out.loss_phys.detach().cpu()) if out.loss_phys is not None else 0.0
+                total_cls = float(out.loss_cls.detach().cpu()) if out.loss_cls is not None else 0.0
             else:
                 # Fallback: per-sample processing (for non-hybrid models)
                 total_loss = None
@@ -625,14 +639,20 @@ class PINNTrainer:
                     else:
                         total_loss = total_loss + (out.loss_total / B)
                     
-                    total_phys += float(out.loss_phys.detach().cpu()) / B
-                    total_cls += float(out.loss_cls.detach().cpu()) / B
+                    # Handle potential None or zero values
+                    p_loss = float(out.loss_phys.detach().cpu()) if out.loss_phys is not None else 0.0
+                    c_loss = float(out.loss_cls.detach().cpu()) if out.loss_cls is not None else 0.0
+                    total_phys += p_loss / B
+                    total_cls += c_loss / B
                     batch_probs.append(out.probs)
                     batch_labels.append(batch["labels"][i:i+1])
                 
                 loss = total_loss
                 probs = torch.cat(batch_probs)
                 labels = torch.cat(batch_labels)
+
+        # Initialize did_step early for scope
+        did_step = False
 
         # NaN check - skip update if loss is NaN
         if torch.isnan(loss) or torch.isinf(loss):
@@ -678,7 +698,7 @@ class PINNTrainer:
             # Use gradient accumulator (handles scaling and stepping)
             did_step = self.grad_accumulator.step(loss, self.step)
             if did_step:
-                grad_norm = self.cfg.train.grad_clip  # Approximate
+                grad_norm = self.grad_accumulator.last_grad_norm  # Actual grad norm
         elif self.scaler is not None:
             # CUDA with AMP
             self.scaler.scale(loss).backward()
@@ -722,11 +742,11 @@ class PINNTrainer:
             else:
                 self.scheduler.step()
         
-        # FIXED: Aggressive MPS memory cleanup with gc
+        # MPS memory cleanup
         if self.device.type == "mps" and self.step % self.memory_cleanup_every == 0:
             aggressive_memory_cleanup()
-            gc.collect()  # Force Python garbage collection
-            torch.mps.empty_cache()  # Explicitly clear MPS cache
+            gc.collect()
+            torch.mps.empty_cache()
             
         with torch.no_grad():
             self.metrics_buffer.add(probs.detach().cpu().numpy(), labels.detach().cpu().numpy())
@@ -747,11 +767,17 @@ class PINNTrainer:
             self._accumulated_phys = 0.0
             self._accumulated_cls = 0.0
             self._accumulated_count = 0
+            
+            # Store last valid grad_norm for logging (handle sparse updates)
+            self._last_grad_norm = float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm
         else:
-            # FIXED: Avoid .item() which can hang on MPS - use detach().cpu() instead
+            # Avoid .item() which can hang on MPS - use detach().cpu() instead
             avg_loss = float(loss.detach().cpu())
             avg_phys = total_phys
             avg_cls = total_cls
+            
+        # Use last valid grad_norm if current step didn't update
+        current_grad_norm = float(grad_norm) if did_step else getattr(self, '_last_grad_norm', 0.0)
         
         metrics_dict = {
             "loss": avg_loss,
@@ -759,8 +785,9 @@ class PINNTrainer:
             "cls": avg_cls,
             "lam": out.lambda_phys,
             "alpha": out.fourier_alpha,
-            "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+            "grad_norm": current_grad_norm,
             "did_step": did_step,
+            "ess": out.ess,  # Log ESS for monitoring
         }
         
         # Log to W&B
@@ -776,7 +803,7 @@ class PINNTrainer:
                 "step": self.step
             }
             
-            # ✅ FIX: Log GradNorm weights for debugging
+            # Log GradNorm weights for debugging
             if hasattr(self.model, '_gradnorm_weights') and self.cfg.physics.enable:
                 use_gradnorm = getattr(self.cfg.physics, 'use_gradnorm', False)
                 if use_gradnorm:
@@ -824,7 +851,8 @@ class PINNTrainer:
                     
                     for k, v in batch.items():
                         if isinstance(v, torch.Tensor):
-                            batch[k] = v.to(self.device, non_blocking=True)
+                            # FIXED: Remove non_blocking=True on MPS to prevent memory corruption in validation too
+                            batch[k] = v.to(self.device)
                     
                     B = batch["coords"].shape[0]
                     batch_probs = []
@@ -994,10 +1022,48 @@ class PINNTrainer:
                                 f"ECE={h_metrics['ece']:.3f} | Pos={h_metrics['n_pos']}/{h_metrics['n_total']}"
                             )
                         
-                        # Track best
+                        # Track best and plateau rollback
                         if val_tss > self.best_val_tss:
                             self.best_val_tss = val_tss
+                            self.consecutive_drops = 0
                             self.logger.info(f"🌟 New best validation TSS: {val_tss:.4f}")
+                        elif val_tss < self.last_val_tss:
+                            self.consecutive_drops += 1
+                            self.logger.info(f"📉 TSS dropped ({self.last_val_tss:.4f} → {val_tss:.4f}), consecutive drops: {self.consecutive_drops}/{self.plateau_patience}")
+                            
+                            # Plateau rollback: reload best checkpoint with reduced LR
+                            current_lr = self.optimizer.param_groups[0]['lr']
+                            if self.consecutive_drops >= self.plateau_patience and current_lr > self.min_lr_for_rollback:
+                                if self.checkpoint_mgr:
+                                    best_path = self.checkpoint_mgr.checkpoint_dir / "best_model.pt"
+                                    if best_path.exists():
+                                        new_lr = current_lr * self.plateau_lr_factor
+                                        self.logger.info(f"🔄 PLATEAU ROLLBACK: Reloading best model, LR {current_lr:.2e} → {new_lr:.2e}")
+                                        
+                                        # Load best model weights only (keep current step)
+                                        checkpoint = self.checkpoint_mgr.load(best_path)
+                                        self.model.load_state_dict(checkpoint['model_state_dict'])
+                                        if self.ema and 'ema_state_dict' in checkpoint:
+                                            self.ema.load_state_dict(checkpoint['ema_state_dict'])
+                                        
+                                        # Reset optimizer with new LR
+                                        for param_group in self.optimizer.param_groups:
+                                            param_group['lr'] = new_lr
+                                            param_group['initial_lr'] = new_lr
+                                        
+                                        # Fresh scheduler from new LR
+                                        remaining = max(1, (self.cfg.train.steps - self.step) // self.accum_steps)
+                                        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                                            self.optimizer, T_max=remaining, eta_min=1e-7
+                                        )
+                                        
+                                        self.consecutive_drops = 0
+                                        self.last_val_tss = self.best_val_tss
+                        else:
+                            # TSS same or slightly better but not new best
+                            self.consecutive_drops = 0
+                        
+                        self.last_val_tss = val_tss
                         
                         # Save checkpoint with FULL state (EMA, scheduler, early stopping)
                         if self.checkpoint_mgr:
@@ -1011,6 +1077,14 @@ class PINNTrainer:
                                 early_stopping=self.early_stopping,
                                 best_val_tss=self.best_val_tss,
                             )
+                        
+                        # MPS auto-restart: exit after checkpoint to clear memory leak
+                        auto_restart = getattr(self.cfg.train, 'auto_restart_every', 0)
+                        if auto_restart > 0 and self.step % auto_restart == 0 and self.step > 0:
+                            self.logger.info(f"🔄 Auto-restart triggered at step {self.step} (MPS memory cleanup)")
+                            self.logger.info(f"   Resume with: --resume outputs/checkpoints/train_balanced/checkpoint_step_{self.step:07d}.pt")
+                            import sys
+                            sys.exit(42)  # Special exit code for auto-restart
                         
                         # Early stopping check
                         if self.early_stopping(val_tss, self.step):
@@ -1072,23 +1146,24 @@ def main():
         )
         trainer.step = resume_step
         trainer.best_val_tss = best_val_tss if best_val_tss > 0 else resume_metric
+        # Also restore checkpoint manager's best_metric to prevent false "NEW BEST" prints
+        trainer.checkpoint_mgr.best_metric = trainer.best_val_tss
         
-        # If using --resume, reset optimizer LR to config value and step scheduler
+        # If using --resume, reset optimizer LR to config value
+        # DON'T step scheduler - start fresh from config LR for fine-tuning
         if args.resume:
-            # Reset optimizer LR to config value (checkpoint had old LR)
             new_lr = cfg.train.lr
             for param_group in trainer.optimizer.param_groups:
                 param_group['lr'] = new_lr
                 param_group['initial_lr'] = new_lr
             
-            # Step scheduler to current position
-            if trainer.scheduler is not None:
-                for _ in range(resume_step):
-                    trainer.scheduler.step()
-                current_lr = trainer.scheduler.get_last_lr()[0]
-            else:
-                current_lr = new_lr
-            logger.info(f"   📊 LR reset to config value, now at {current_lr:.2e} (step {resume_step})")
+            # Create fresh scheduler from current position to end
+            remaining_steps = max(1, (cfg.train.steps - resume_step) // trainer.accum_steps)
+            trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                trainer.optimizer, T_max=remaining_steps, eta_min=1e-7
+            )
+            current_lr = new_lr
+            logger.info(f"   📊 Fresh LR schedule: {current_lr:.2e} → 1e-7 over {remaining_steps} optimizer steps")
         
         # Check if EMA was restored
         ema_restored = 'ema_state_dict' in trainer.checkpoint_mgr.load(resume_path)
@@ -1142,7 +1217,7 @@ def main():
                 pil_top_pct=cfg.data.pil_top_pct,
                 training=True,
                 augment=True,
-                noise_std=0.02,
+                noise_std=0.05,  # Increased from 0.02 for better regularization
                 max_cached_harps=500,
                 # SOTA features
                 use_pil_evolution=getattr(cfg.data, 'use_pil_evolution', True),
@@ -1186,12 +1261,26 @@ def main():
         
         logger.info("  Datasets created!")
         
-        # Sampler
+        # Sampler: Only use WeightedRandomSampler if weights are non-uniform
+        # When weights are uniform, replacement=True causes some samples to be 
+        # skipped and others oversampled, undermining balanced coverage
         horizon_cols = [f"y_geq_M_{h}h" for h in cfg.classifier.horizons]
         labels = train_df[horizon_cols].to_numpy().sum(axis=1) > 0
         weights = np.full(len(train_df), cfg.train.sampler.smoothing)
         weights[labels] = cfg.train.sampler.positive_multiplier
-        sampler = WeightedRandomSampler(torch.tensor(weights), len(weights))
+        
+        # Check if weights are effectively uniform (all same value)
+        weights_uniform = np.allclose(weights, weights[0])
+        if weights_uniform:
+            # Uniform weights: use regular shuffle (no sampler)
+            sampler = None
+            shuffle_train = True
+            logger.info("  Sampler: disabled (uniform weights, using shuffle)")
+        else:
+            # Non-uniform weights: use weighted sampling
+            sampler = WeightedRandomSampler(torch.tensor(weights), len(weights), replacement=True)
+            shuffle_train = False
+            logger.info(f"  Sampler: weighted (pos_mult={cfg.train.sampler.positive_multiplier})")
         
         logger.info("  Creating DataLoaders...")
         # MPS/Mac optimization: pin_memory can cause hangs
@@ -1209,7 +1298,8 @@ def main():
         train_loader = DataLoader(
             train_ds, 
             batch_size=cfg.train.batch_size, 
-            sampler=sampler, 
+            sampler=sampler,
+            shuffle=shuffle_train if sampler is None else False,  # shuffle only when no sampler
             num_workers=cfg.train.num_workers, 
             pin_memory=use_pin_memory,
             persistent_workers=persistent_workers,

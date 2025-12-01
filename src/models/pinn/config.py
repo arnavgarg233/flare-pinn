@@ -253,7 +253,7 @@ class PhysicsConfig(BaseModel):
     
     # Gradient scaling for physics loss (prevents dominating classification)
     physics_grad_scale: float = Field(
-        default=0.5, ge=0.1, le=2.0,
+        default=0.5, ge=0.001, le=2.0,
         description="Scale factor for physics gradients (lower = less interference with classification)"
     )
     
@@ -263,10 +263,11 @@ class PhysicsConfig(BaseModel):
         description="Reduced collocation points during physics warmup (memory optimization)"
     )
     
-    # MPS physics mode: create_graph=False is more stable on MPS (avoids hangs)
+    # MPS physics mode: create_graph=False is more stable on MPS but breaks physics training!
+    # FIXED: Default to False because True disables gradient flow from physics residuals.
     mps_fast_physics: bool = Field(
-        default=True,
-        description="On MPS, disable create_graph in autograd for stability. Set True to avoid hangs."
+        default=False,
+        description="On MPS, disable create_graph in autograd. WARNING: Setting True prevents physics parameters from learning!"
     )
     
     @field_validator('lambda_phys_schedule')
@@ -391,7 +392,7 @@ class TrainConfig(BaseModel):
     batch_size: int = Field(default=1, ge=1, le=64)
     num_workers: int = Field(default=0, ge=0, le=32, description="Number of DataLoader workers")
     lr: float = Field(default=1e-3, ge=1e-6, le=1e-1)
-    grad_clip: float = Field(default=1.0, ge=0.0, le=10.0)
+    grad_clip: float = Field(default=1.0, ge=0.0, le=100.0)
     amp: bool = Field(default=True, description="Automatic mixed precision")
     log_every: int = Field(default=25, ge=1)
     eval_every: int = Field(default=500, ge=10)
@@ -419,6 +420,16 @@ class TrainConfig(BaseModel):
         default=8192, ge=1024, le=65536,
         description="Max collocation points per sample (reduce for memory)"
     )
+    
+    # MPS auto-restart to clear memory leaks
+    auto_restart_every: int = Field(
+        default=0, ge=0, le=100000,
+        description="Auto-restart every N steps to clear MPS memory (0=disabled)"
+    )
+    
+    # Plateau rollback settings
+    plateau_patience: int = Field(default=3, ge=1, le=20, description="Consecutive val drops before rollback")
+    plateau_lr_factor: float = Field(default=0.5, ge=0.1, le=0.9, description="LR multiplier on rollback")
     
     # SAM optimizer (experimental - high memory cost)
     use_sam: bool = Field(default=False, description="Use Sharpness-Aware Minimization (doubles memory)")

@@ -281,6 +281,7 @@ class MPSGradientAccumulator:
         
         self._accum_count = 0
         self._global_step = 0
+        self.last_grad_norm = 0.0  # Store actual gradient norm for logging
     
     def step(self, loss: torch.Tensor, step: int) -> bool:
         """
@@ -293,22 +294,46 @@ class MPSGradientAccumulator:
         Returns:
             True if optimizer stepped
         """
+        # ⚡ SAFETY: Check for NaN/Inf in loss before backward
+        if torch.isnan(loss) or torch.isinf(loss):
+            return False
+
         # Scale loss
         scaled_loss = loss / self.accum_steps
         
         # Backward
         scaled_loss.backward()
         
+        # ⚡ SAFETY: Check for NaN/Inf gradients in micro-batch
+        has_nan = False
+        for p in self.model.parameters():
+            if p.grad is not None:
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    has_nan = True
+                    break
+        
+        if has_nan:
+            # Discard this micro-batch accumulation
+            self.zero_grad()
+            return False
+        
         self._accum_count += 1
         
         # Step optimizer when accumulated enough
         if self._accum_count >= self.accum_steps:
-            # Clip gradients
+            # Clip gradients and store actual norm
             if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
+                self.last_grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), 
                     self.grad_clip
-                )
+                ).item()
+            else:
+                # Compute norm without clipping for logging
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                self.last_grad_norm = total_norm ** 0.5
             
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)

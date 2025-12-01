@@ -898,9 +898,9 @@ class ClassifierHead(nn.Module):
             
             combined = torch.cat([X_mean, X_std], dim=-1)  # [B, 2*C]
         
-        # Physics features
+        # Physics features (18 features from PhysicsFeatureExtractor)
         if self.use_physics_features:
-            physics_feats = self.physics_extractor(feats, observed_mask)  # [B, 9]
+            physics_feats = self.physics_extractor(feats, observed_mask)  # [B, 18]
             
             # Apply RF importance weights if available
             if self.rf_weights is not None:

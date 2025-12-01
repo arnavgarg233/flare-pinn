@@ -35,7 +35,7 @@ model:
   in_channels: 3
   
   fourier:
-    max_log2_freq: 4
+    max_log2_freq: 6    # Freq 64 (was 16) - needed to resolve sharp PIL gradients (~4px features)
     ramp_frac: 0.5
   
   encoder:
@@ -52,8 +52,8 @@ model:
 # =============================================================================
 classifier:
   hidden: 128
-  dropout: 0.40             # High dropout to prevent 24h from overfitting
-  horizons: [6, 12, 24]     # All 3 horizons
+  dropout: 0.35             # Lower dropout - physics provides regularization (per PINN literature)
+  horizons: [6, 12, 24]     # Original 3 horizons, focus on 24h
   
   # ✅ Class-Balanced Focal Loss (Cui et al. 2019)
   # Automatically computes per-horizon weights based on sample counts!
@@ -74,7 +74,7 @@ classifier:
   
   # NO label smoothing - hurts rare classes
   label_smoothing: 0.0
-  confidence_penalty: 0.02
+  confidence_penalty: 0.0   # Disabled - hurts rare class confidence
 
 # =============================================================================
 # PHYSICS - GradNorm for automatic loss balancing
@@ -83,14 +83,16 @@ physics:
   enable: true
   resistive: true
   boundary_terms: false
-  mps_fast_physics: false  # create_graph=True - full gradient flow, RAR preserves graph
-  physics_grad_scale: 1.0  # Full physics gradients - GradNorm handles balancing
+  mps_fast_physics: false   # create_graph=True - REQUIRED for physics training (was True/broken)
+  physics_grad_scale: 0.20  # Research: physics should be 30-100% of data loss, not 6%
+  gradient_clamp_value: 50.0 # Clamp spatial gradients to prevent explosion
+  enforce_force_free: false  # Explicitly disable advanced constraints
   
   # ✅ GradNorm ENABLED (Chen et al. 2018)
   # Automatically balances classification vs physics by equalizing gradient scales
   # Much better than fixed lambda schedules for multi-task learning!
   use_gradnorm: true
-  gradnorm_alpha: 1.5      # Restoring force strength (1.5 = moderate equalization)
+  gradnorm_alpha: 1.0      # Reduced from 1.5 - let classifier lead more
   gradnorm_update_freq: 15 # ⚡ SPEED: Update every 15 steps (was 7) - still converges, less overhead
   
   # LRA disabled (GradNorm is better)
@@ -103,11 +105,18 @@ physics:
   use_causal_training: true
   causal_decay: 1.0        # Softened from 2.0 (avoid stacking too many strong reweightings)
   
-  # Fallback schedule - UNUSED when use_gradnorm=true
-  # GradNorm is the ONLY mechanism deciding physics vs cls weight (base λ=1.0)
+  # Curriculum Learning: Pure classifier first, then gradual physics ramp
+  # Phase 1 (0-12k): Pure classifier only (lambda=0) - learn magnetic patterns
+  # Phase 2 (12k-16k): Gradual physics ramp - let GradNorm find equilibrium smoothly
+  # Phase 3 (16k+): Full physics + GradNorm
+  # CURRICULUM: Pure classifier first, then strong physics for 24h
   lambda_phys_schedule:
-    - [0.0, 1.0]            # UNUSED when use_gradnorm=true (base=1.0)
-    - [1.0, 1.0]
+    - [0.0, 0.0]            # Step 0: NO physics
+    - [0.20, 0.0]           # Step 12k: End pure classifier
+    - [0.25, 0.5]           # Step 15k: Moderate physics
+    - [0.33, 0.8]           # Step 20k: Strong physics (we're here)
+    - [0.50, 1.0]           # Step 30k: Full physics
+    - [1.0, 1.0]            # Maintain full physics
 
 eta:
   min: 1.0e-4
@@ -145,23 +154,32 @@ train:
   steps: 60000
   batch_size: 2
   num_workers: 2  # ⚡ SPEED: Enable workers for CPU-GPU overlap (PIL features compute while GPU trains)
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8  # Increased from 1 to 8 for stability (Effective batch = 16)
   
-  lr: 3.0e-4                # Goldilocks LR: not too aggressive for stage 3 resume
-  grad_clip: 1.0
+  lr: 2.0e-4                # Higher LR to escape local minimum and show declining trend
+  grad_clip: 1.0            # Standard value - per-horizon cb_focal now handles imbalance correctly
   amp: false
+  
+  # Plateau rollback: if TSS drops N times in a row, reload best model with lower LR
+  # With rare-event TSS, validation noise is high - don't be too trigger-happy
+  plateau_patience: 2       # consecutive drops before rollback (faster recovery)
+  plateau_lr_factor: 0.5    # multiply LR by this on rollback
   
   log_every: 100
   eval_every: 2000
   checkpoint_every: 2000
   checkpoint_dir: "outputs/checkpoints/train_balanced"  # Resume from existing checkpoints
   
+  # MPS memory leak workaround: auto-restart after checkpoint to clear memory
+  # Set to 0 to disable. Exits with code 42 after saving checkpoint.
+  auto_restart_every: 2000  # Restart every 2k steps (same as checkpoint_every)
+  
   use_ema: true
-  ema_decay: 0.999
+  ema_decay: 0.995          # Faster EMA for high-variance rare event training
   
   scheduler:
     type: cosine
-    warmup_steps: 1000      # Short warmup for curriculum stage 3 (resuming from 14k)
+    warmup_steps: 2000      # Standard warmup for fresh start
     min_lr: 1.0e-6
   
   # Sampler: DISABLED - cb_focal handles imbalance, don't triple-stack!

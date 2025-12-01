@@ -502,6 +502,9 @@ class ConsolidatedWindowsDataset(Dataset):
         
         # Augmentation
         if self.augment:
+            # Ensure coords are contiguous before modification to prevent memory issues
+            coords = coords.contiguous()
+            
             geom_changed = False
             if np.random.rand() > 0.5:
                 frames = torch.flip(frames, dims=[-1])
@@ -529,11 +532,17 @@ class ConsolidatedWindowsDataset(Dataset):
                 geom_changed = True
             
             if geom_changed:
+                # Re-sample ground truth at new coordinates
                 gt_b = _resample_gt_from_frames(frames, coords)
             
             if self.noise_std > 0:
                 frames = frames + torch.randn_like(frames) * self.noise_std
                 gt_b = gt_b + torch.randn_like(gt_b) * (self.noise_std * 0.5)
+        
+        # Final safety check: ensure contiguous memory layout
+        coords = coords.contiguous()
+        frames = frames.contiguous()
+        gt_b = gt_b.contiguous()
         
         return {
             "coords": coords,

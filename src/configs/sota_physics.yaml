@@ -1,0 +1,133 @@
+# SOTA Physics-Informed Neural Network Configuration
+# Target: Beat SOTA TSS > 0.85 @ 24h using physics-informed approach
+#
+# ALL SOTA IMPROVEMENTS ENABLED:
+# 1. Asymmetric focal loss for severe class imbalance
+# 2. Label smoothing (0.05) for calibration
+# 3. Confidence penalty for calibrated probabilities
+# 4. Very aggressive positive oversampling (150x)
+# 5. Aggressive physics curriculum (start early, ramp high)
+# 6. RF feature importance guidance
+# 7. Spatial + temporal attention
+# 8. Physics-derived features
+# 9. Learned resistivity
+# 10. Strong EMA for generalization
+
+seed: 42
+device: "mps"  # Change to "cuda" for NVIDIA GPUs
+
+model:
+  model_type: "hybrid"     # CNN encoder + coordinate MLP
+  hidden: 512              # Larger hidden dimension for more capacity
+  layers: 12               # Deep network for complex field representations
+  learn_eta: true          # Learn spatially-varying resistivity
+  eta_scalar: 0.01
+  fourier:
+    max_log2_freq: 7       # Higher frequencies for fine PIL structure
+    ramp_frac: 0.1         # Quick ramp to capture high-freq features early
+
+classifier:
+  hidden: 384              # Larger classifier for physics features
+  dropout: 0.3             # Moderate dropout for generalization
+  horizons: [6, 12, 24]    # Multi-horizon prediction
+  
+  # SOTA: Asymmetric focal loss - critical for imbalanced flare data
+  loss_type: "asymmetric"
+  focal_alpha: 0.75        # Weight for positive (flare) class
+  focal_gamma: 1.5         # Mild focusing on hard positives
+  asymmetric_gamma_neg: 4.5  # STRONG focusing on hard negatives (key for imbalance!)
+  
+  # SOTA: Label smoothing for better calibration and ECE
+  label_smoothing: 0.05
+  
+  # SOTA: Confidence penalty prevents overconfident predictions
+  confidence_penalty: 0.03
+  
+  # Enable all SOTA features
+  use_rf_guidance: true    # Domain-knowledge feature weighting
+  use_attention: true      # Spatial + temporal attention pooling
+  use_physics_features: true  # Physics-derived discriminative features
+  
+  pos_weight: null         # Not used with asymmetric focal
+
+physics:
+  enable: true
+  resistive: true          # Full resistive MHD induction equation
+  boundary_terms: false
+  
+  # FIXED: Physics starts at ZERO to prevent NaN!
+  # Key insight: Classifier must converge first, then physics shapes features
+  lambda_phys_schedule:
+    - [0.0, 0.0]           # NO physics at start (prevents NaN!)
+    - [0.15, 0.0]          # Still zero during classifier warm-up
+    - [0.25, 0.5]          # Start introducing physics gently
+    - [0.4, 2.0]           # Moderate physics
+    - [0.6, 5.0]           # Stronger physics
+    - [0.8, 10.0]          # Strong physics
+    - [1.0, 15.0]          # Maximum (capped by code)
+
+eta:
+  min: 1.0e-5              # Lower bound for learned eta
+  max: 2.0                 # Higher max for faster diffusion regions
+  tv_weight: 1.0e-3        # Slightly stronger TV for smoother eta
+
+loss_weights:
+  cls: 2.0                 # Lower cls weight (physics is main driver)
+  data: 1.0                # Data fitting constraint
+  curl_consistency: 0.15   # Stronger curl consistency
+
+collocation:
+  n_max: 24576             # High resolution physics sampling
+  alpha_start: 0.7         # Strong PIL bias from start
+  alpha_end: 0.98          # Almost all PIL focus at end
+  impw_clip_quantile: 0.995
+
+train:
+  steps: 60000             # Longer training for physics convergence
+  batch_size: 1            # Single sample (PINN requires per-sample physics)
+  lr: 2.0e-4               # Lower LR for stability with strong physics
+  grad_clip: 3.0           # FIXED: More permissive (was 0.3, too aggressive)
+  amp: false               # Disable AMP for MPS compatibility
+  log_every: 100
+  eval_every: 2000
+  checkpoint_every: 5000
+  checkpoint_dir: "outputs/checkpoints/sota_physics"
+  
+  scheduler:
+    type: "cosine"
+    warmup_steps: 4000     # Longer warmup for stability with physics
+    min_lr: 1.0e-6
+  
+  num_workers: 4           # Parallel data loading to avoid I/O bottleneck
+  
+  sampler:
+    strategy: "class_balanced"
+    positive_multiplier: 40.0    # FIXED: More moderate (was 150, too aggressive)
+    smoothing: 0.35              # Moderate smoothing on weights
+  
+  use_ema: true
+  ema_decay: 0.9997        # Very slow EMA for best generalization
+
+data:
+  use_real: true
+  windows_parquet: "data/interim/windows_train.parquet"
+  frames_meta_parquet: "/Volumes/Lexar/flare_forecasting/frames_meta.parquet"
+  npz_root: "/Volumes/Lexar/flare_forecasting"
+  target_size: 128         # Resolution for CNN encoder
+  input_hours: 48          # Full 48h history
+  P_per_t: 3072            # Dense spatial sampling
+  pil_top_pct: 0.10        # Tighter PIL threshold
+  val_fraction: 0.12       # Hold out 12% for validation
+  
+  scalar_features:
+    - frame_count_in_window
+    - obs_coverage
+    - horizon_coverage_6h
+    - horizon_coverage_12h
+    - horizon_coverage_24h
+
+  # Dummy fallback
+  dummy_T: 8
+  dummy_H: 64
+  dummy_W: 64
+  dummy_num_samples: 2048

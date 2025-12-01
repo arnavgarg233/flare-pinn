@@ -4,7 +4,6 @@
 
 **Objective**: Develop a hybrid deep learning model for predicting M/X-class solar flare occurrence at 6, 12, and 24-hour horizons using physics-informed neural networks (PINNs).
 
-**Target Performance**: TSS > 0.80 (competitive with current state-of-the-art)
 
 ---
 
@@ -399,6 +398,4 @@ tools/
 
 ### Physics
 - Priest, E. (2014). Magnetohydrodynamics of the Sun. Cambridge University Press.
-
-*Complete bibliography to be added*
 

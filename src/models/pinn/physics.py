@@ -324,7 +324,13 @@ class VectorInduction2p5D(nn.Module):
         
         ones = torch.ones_like(field)
         is_mps = field.device.type == "mps"
-        create_graph = self.training and not (is_mps and self.mps_fast_physics)
+        # CRITICAL FIX: Physics training REQUIRES create_graph=True to compute 
+        # d(Loss)/d(Params) via d(Residual)/d(Params).
+        # The residual depends on spatial derivatives (dB/dx, etc).
+        # d(Residual)/d(Params) requires differentiating through these spatial derivatives.
+        # This needs double backward (create_graph=True).
+        # Without this, the physics loss has NO gradient w.r.t. model parameters!
+        create_graph = self.training
         
         try:
             grads = torch.autograd.grad(
@@ -347,11 +353,13 @@ class VectorInduction2p5D(nn.Module):
         with torch.no_grad():
             has_invalid_grads = torch.isnan(grads).any() or torch.isinf(grads).any()
         if has_invalid_grads:
-            grads = torch.nan_to_num(grads, nan=0.0, posinf=10.0, neginf=-10.0)
+            # ⚡ SAFETY: Replace NaN/Inf with zero gradients
+            grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
         
         if self.enable_gradient_clamping:
             scale = self.gradient_clamp_value
-            grads = scale * torch.tanh(grads / (scale + 1e-8))
+            # ⚡ SAFETY: Use hard clamp instead of tanh for simpler 2nd derivatives
+            grads = grads.clamp(-scale, scale)
         
         df_dx = grads[..., 0:1]
         df_dy = grads[..., 1:2]
@@ -385,7 +393,8 @@ class VectorInduction2p5D(nn.Module):
         
         N, C = fields.shape
         is_mps = fields.device.type == "mps"
-        create_graph = self.training and not (is_mps and self.mps_fast_physics)
+        # CRITICAL FIX: Physics training REQUIRES create_graph=True
+        create_graph = self.training
         
         # Compute gradients for all channels at once by summing
         # This works because grad(sum(f_i), x) = sum(grad(f_i, x))
@@ -417,11 +426,12 @@ class VectorInduction2p5D(nn.Module):
             
             with torch.no_grad():
                 if torch.isnan(grads).any() or torch.isinf(grads).any():
-                    grads = torch.nan_to_num(grads, nan=0.0, posinf=10.0, neginf=-10.0)
+                    grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
             
             if self.enable_gradient_clamping:
                 scale = self.gradient_clamp_value
-                grads = scale * torch.tanh(grads / (scale + 1e-8))
+                # ⚡ SAFETY: Use hard clamp instead of tanh for simpler 2nd derivatives
+                grads = grads.clamp(-scale, scale)
             
             all_dx.append(grads[:, 0:1])
             all_dy.append(grads[:, 1:2])
@@ -694,9 +704,9 @@ class VectorInduction2p5D(nn.Module):
                 B_scale = self._B_scale_ema.clamp(min=0.05, max=100.0)
                 u_scale = self._u_scale_ema.clamp(min=0.02, max=10.0)
             
-            # FIXED: Clamp norm_factor more aggressively
-            norm_factor = (B_scale * u_scale).clamp(min=1e-4).sqrt().clamp(min=0.05, max=10.0)
-            return residuals / norm_factor
+            # FIXED: Clamp norm_factor more aggressively and add larger epsilon
+            norm_factor = (B_scale * u_scale).clamp(min=1e-4).sqrt().clamp(min=0.1, max=10.0)
+            return residuals / (norm_factor.detach() + 1e-6)
         elif self.normalization == "per_scale":
             with torch.no_grad():
                 residual_scales = residuals.abs().mean(dim=0, keepdim=True).clamp(min=1e-6)
@@ -915,7 +925,8 @@ class VectorInduction2p5D(nn.Module):
             JxB_z = Jz * Bx - Jx * Bz
             
             JxB_sq = JxB_x**2 + JxB_y**2 + JxB_z**2
-            B_sq = (Bx**2 + By**2 + Bz**2).clamp(min=1e-8)
+            # FIX: Add larger epsilon for division stability
+            B_sq = (Bx**2 + By**2 + Bz**2).clamp(min=1e-6)
             
             # Normalized force-free violation
             ff_violation = JxB_sq / B_sq
