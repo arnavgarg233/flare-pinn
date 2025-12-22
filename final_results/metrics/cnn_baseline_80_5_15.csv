@@ -1,0 +1,4 @@
+model,horizon_hours,tss,pod,far,csi,accuracy,tp,fn,fp,tn,threshold
+CNN_Baseline,6,0.8257,0.9714,0.9606,0.0394,0.8550,34,1,828,4853,0.18
+CNN_Baseline,12,0.8256,0.9667,0.9322,0.0676,0.8600,58,2,798,4858,0.21
+CNN_Baseline,24,0.7824,0.9560,0.9182,0.0815,0.8284,87,4,977,4648,0.21

@@ -1,0 +1,43 @@
+# Core dependencies for flare-pinn
+# Python 3.11+
+# For GPU: Install PyTorch separately (see below)
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+xarray>=2023.1.0
+pyarrow>=11.0.0
+fastparquet>=2023.1.0
+
+# Astronomy
+astropy>=5.2
+sunpy>=5.0
+drms>=0.7.1
+parfive>=2.0.0
+
+# Image processing
+scikit-image>=0.20.0
+opencv-python>=4.7.0
+
+# ML utilities
+einops>=0.6.0
+tqdm>=4.65.0
+tenacity>=8.2.0
+wandb>=0.15.0
+
+# Configuration & validation
+pydantic>=2.0.0
+pyyaml>=6.0
+
+# Visualization
+matplotlib>=3.7.0
+click>=8.1.0
+
+# PyTorch - Install separately based on CUDA version
+# For CUDA 11.8:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For CUDA 12.1:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+torchvision>=0.16.0

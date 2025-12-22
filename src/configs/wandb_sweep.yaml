@@ -1,0 +1,43 @@
+# =============================================================================
+# W&B Hyperparameter Sweep Configuration
+# =============================================================================
+# Best result: Seed 1234 achieved 0.812 test TSS at 46k
+# Sweep approach: 40k → 44k Bayesian optimization
+# Starting point: 40k CNN baseline checkpoint
+# Validation: 5% validation set (1,905 windows)
+# Final model trained with seed 1234 to 46k
+# =============================================================================
+
+program: tools/run_sweep_agent.py
+method: bayes  # Bayesian optimization - efficient with deterministic seed
+
+metric:
+  name: val/tss_24h
+  goal: maximize
+
+parameters:
+  # Lambda physics max (final value at 60k)
+  lambda_phys_max:
+    values: [0.2, 0.4, 0.6]
+  
+  # Physics gradient scale
+  physics_grad_scale:
+    distribution: uniform
+    min: 0.08
+    max: 0.30
+  
+  # Horizon weighting
+  causal_decay:
+    values: [0.85, 1.0, 1.15]
+  
+  # GradNorm
+  gradnorm_alpha:
+    values: [0.0, 1.0]
+  
+  # Learning rate
+  lr:
+    values: [5.0e-6, 1.0e-5, 2.0e-5]
+
+# Bayesian optimization: ~20 runs (~5 hours total)
+run_cap: 20
+
